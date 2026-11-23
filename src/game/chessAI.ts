@@ -77,7 +77,18 @@ class StockfishWorkerClient {
       const timeout = window.setTimeout(() => finish(false), 4000);
 
       try {
-        const worker = new Worker('/stockfish/stockfish-19-lite-single.js');
+        const baseUrl = import.meta.env.BASE_URL.endsWith('/')
+          ? import.meta.env.BASE_URL
+          : `${import.meta.env.BASE_URL}/`;
+        const workerUrl = `${baseUrl}stockfish/stockfish-19-lite-single.js`;
+        const wasmPath = `${baseUrl}stockfish/stockfish-19-lite-single.wasm`;
+        const wasmUrl =
+          typeof window !== 'undefined'
+            ? new URL(wasmPath, window.location.origin).href
+            : wasmPath;
+        const worker = new Worker(
+          `${workerUrl}#${encodeURIComponent(wasmUrl)}`
+        );
         this.worker = worker;
 
         let uciReady = false;
@@ -189,6 +200,129 @@ class StockfishWorkerClient {
       worker.postMessage(
         `go depth ${config.stockfishDepth} movetime ${config.stockfishMoveTimeMs}`
       );
+    });
+  }
+
+  async evaluatePositionCp(fen: string): Promise<number | null> {
+    if (this.listeners.size > 0) return null;
+    const ok = await this.ensureInit();
+    if (!ok || !this.worker) return null;
+
+    return new Promise((resolve) => {
+      const worker = this.worker;
+      if (!worker) {
+        resolve(null);
+        return;
+      }
+
+      let done = false;
+      let latestCp: number | null = null;
+      let sawMate = false;
+
+      const finish = (score: number | null) => {
+        if (done) return;
+        done = true;
+        this.listeners.delete(onLine);
+        window.clearTimeout(timeout);
+        resolve(score);
+      };
+
+      const onLine = (line: string) => {
+        const mateMatch = line.match(/\bscore\s+mate\s+(-?\d+)/);
+        if (mateMatch) {
+          sawMate = true;
+        }
+        const cpMatch = line.match(/\bscore\s+cp\s+(-?\d+)/);
+        if (cpMatch) {
+          latestCp = Number(cpMatch[1]);
+        }
+        if (line.startsWith('bestmove ')) {
+          finish(sawMate ? 99999 : latestCp);
+        }
+      };
+
+      const timeout = window.setTimeout(() => {
+        try {
+          worker.postMessage('stop');
+        } catch {
+          // Ignore stop errors
+        }
+        finish(sawMate ? 99999 : latestCp);
+      }, 900);
+
+      this.listeners.add(onLine);
+      worker.postMessage('setoption name Skill Level value 20');
+      worker.postMessage(`position fen ${fen}`);
+      worker.postMessage('go depth 8 movetime 250');
+    });
+  }
+
+  async evaluateSideToMoveScore(
+    fen: string,
+    signal?: AbortSignal
+  ): Promise<{ cp: number; mate: number | null } | null> {
+    if (signal?.aborted || this.listeners.size > 0) return null;
+    const ok = await this.ensureInit();
+    if (!ok || !this.worker || signal?.aborted) return null;
+
+    return new Promise((resolve) => {
+      const worker = this.worker;
+      if (!worker) {
+        resolve(null);
+        return;
+      }
+
+      let done = false;
+      let latestCp = 0;
+      let latestMate: number | null = null;
+
+      const finish = (res: { cp: number; mate: number | null } | null) => {
+        if (done) return;
+        done = true;
+        this.listeners.delete(onLine);
+        signal?.removeEventListener('abort', onAbort);
+        window.clearTimeout(timeout);
+        resolve(res);
+      };
+
+      const onAbort = () => {
+        try {
+          worker.postMessage('stop');
+        } catch {
+          // Ignore stop errors
+        }
+        finish(null);
+      };
+
+      const onLine = (line: string) => {
+        const mateMatch = line.match(/\bscore\s+mate\s+(-?\d+)/);
+        if (mateMatch) {
+          latestMate = Number(mateMatch[1]);
+        }
+        const cpMatch = line.match(/\bscore\s+cp\s+(-?\d+)/);
+        if (cpMatch) {
+          latestCp = Number(cpMatch[1]);
+          latestMate = null;
+        }
+        if (line.startsWith('bestmove ')) {
+          finish({ cp: latestCp, mate: latestMate });
+        }
+      };
+
+      const timeout = window.setTimeout(() => {
+        try {
+          worker.postMessage('stop');
+        } catch {
+          // Ignore stop errors
+        }
+        finish({ cp: latestCp, mate: latestMate });
+      }, 900);
+
+      this.listeners.add(onLine);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      worker.postMessage('setoption name Skill Level value 20');
+      worker.postMessage(`position fen ${fen}`);
+      worker.postMessage('go depth 9 movetime 240');
     });
   }
 
@@ -470,4 +604,146 @@ export async function computeAiMove(
 
   if (signal?.aborted) return null;
   return choice;
+}
+
+/**
+ * Evaluates whether the current position is clearly equal for AI draw-offer decisions.
+ * Returns `equal: true` only when score is within +/- 35 centipawns (or +/- 45 on minimax fallback).
+ */
+export async function evaluatePositionForDraw(
+  fen: string
+): Promise<{ equal: boolean; scoreCp: number }> {
+  const sfCp = await stockfishClient.evaluatePositionCp(fen);
+  if (sfCp !== null) {
+    return {
+      equal: Math.abs(sfCp) <= 35,
+      scoreCp: sfCp,
+    };
+  }
+
+  const game = new Chess(fen);
+  const isBlackTurn = game.turn() === 'b';
+  const score = minimax(game, 2, -Infinity, Infinity, !isBlackTurn);
+  return {
+    equal: Math.abs(score) <= 45,
+    scoreCp: score,
+  };
+}
+
+export interface BlunderEvaluationResult {
+  isBlunder: boolean;
+  cpLoss: number;
+  reason: string;
+}
+
+function normalizeUciScore(score: { cp: number; mate: number | null }): number {
+  if (score.mate !== null) {
+    if (score.mate > 0) return 10000 - score.mate * 40;
+    if (score.mate < 0) return -10000 - score.mate * 40;
+    return -10000;
+  }
+  return Math.max(-9000, Math.min(9000, score.cp));
+}
+
+function evaluateSideToMoveMinimax(game: Chess, depth: number): number {
+  const isBlackTurn = game.turn() === 'b';
+  const blackPerspectiveScore = minimax(
+    game,
+    depth,
+    -Infinity,
+    Infinity,
+    isBlackTurn
+  );
+  return isBlackTurn ? blackPerspectiveScore : -blackPerspectiveScore;
+}
+
+/**
+ * Evaluates a candidate human move before it is confirmed using Stockfish (with minimax fallback).
+ * Flags moves that lose >= 180 centipawns of advantage (or allow/blunder a forced mate).
+ */
+export async function evaluateMoveBlunder(
+  fenBefore: string,
+  move: { from: Square; to: Square; promotion?: PromotionPiece },
+  signal?: AbortSignal
+): Promise<BlunderEvaluationResult> {
+  const gameAfter = new Chess(fenBefore);
+  const applied = gameAfter.move(move);
+  if (!applied) {
+    return { isBlunder: false, cpLoss: 0, reason: '' };
+  }
+
+  // Delivering immediate checkmate is never a blunder
+  if (gameAfter.isCheckmate()) {
+    return { isBlunder: false, cpLoss: 0, reason: '' };
+  }
+
+  const fenAfter = gameAfter.fen();
+
+  const beforeSf = await stockfishClient.evaluateSideToMoveScore(
+    fenBefore,
+    signal
+  );
+  if (signal?.aborted) {
+    return { isBlunder: false, cpLoss: 0, reason: '' };
+  }
+
+  let beforeForMover: number;
+  let afterForMover: number;
+  let afterMateForOpponent: number | null = null;
+
+  if (beforeSf !== null) {
+    beforeForMover = normalizeUciScore(beforeSf);
+
+    const afterSf = await stockfishClient.evaluateSideToMoveScore(
+      fenAfter,
+      signal
+    );
+    if (signal?.aborted) {
+      return { isBlunder: false, cpLoss: 0, reason: '' };
+    }
+
+    if (afterSf !== null) {
+      afterMateForOpponent = afterSf.mate;
+      afterForMover = -normalizeUciScore(afterSf);
+    } else {
+      afterForMover = -evaluateSideToMoveMinimax(gameAfter, 3);
+    }
+  } else {
+    const gameBefore = new Chess(fenBefore);
+    beforeForMover = evaluateSideToMoveMinimax(gameBefore, 3);
+    afterForMover = -evaluateSideToMoveMinimax(gameAfter, 3);
+  }
+
+  const cpLoss = Math.max(0, Math.round(beforeForMover - afterForMover));
+
+  // Suppress false alarms if already up by >6 pawns and still up >4 pawns without allowing mate
+  if (afterForMover >= 450 && afterMateForOpponent === null) {
+    return { isBlunder: false, cpLoss, reason: '' };
+  }
+
+  // Avoid nagging if already completely lost (e.g. -7+ pawns) unless walking into immediate mate
+  if (beforeForMover <= -700 && afterForMover <= -700 && afterMateForOpponent === null) {
+    return { isBlunder: false, cpLoss, reason: '' };
+  }
+
+  const allowsForcedMate =
+    afterMateForOpponent !== null && afterMateForOpponent > 0 && beforeForMover > -8000;
+  const isBlunder = allowsForcedMate || cpLoss >= 180;
+
+  if (!isBlunder) {
+    return { isBlunder: false, cpLoss, reason: '' };
+  }
+
+  const pawnLoss = (Math.min(cpLoss, 1500) / 100).toFixed(1);
+  const reason = allowsForcedMate
+    ? `Allows mate in ${afterMateForOpponent}`
+    : cpLoss >= 700
+      ? 'Loses decisive material'
+      : `Loses ~${pawnLoss} pawns`;
+
+  return {
+    isBlunder: true,
+    cpLoss,
+    reason,
+  };
 }

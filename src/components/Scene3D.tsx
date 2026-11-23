@@ -26,6 +26,7 @@ import type {
   GameStatus,
   LastMove,
   LegalTarget,
+  PendingTutorWarning,
 } from '../game/chessTypes';
 import { ChessBoard3D } from './ChessBoard3D';
 import { ChessPiece3D } from './ChessPiece3D';
@@ -46,6 +47,7 @@ import { isSoftwareWebGL } from '../utils/webglDetect';
 
 interface Scene3DProps {
   hasStarted: boolean;
+  perspectiveColor?: Color;
   pieces: BoardPiece[];
   status: GameStatus;
   selectedSquare: Square | null;
@@ -55,26 +57,49 @@ interface Scene3DProps {
   isAnimating: boolean;
   isHumanTurn: boolean;
   isAiThinking: boolean;
+  isTutorEvaluating: boolean;
+  tutorWarning: PendingTutorWarning | null;
   isCheckmateSequenceActive: boolean;
   onSelectSquare: (square: Square) => void;
+  onProceedTutorMove: () => void;
+  onUndoTutorMove: () => void;
   onAnimationComplete: (animationId: number) => void;
   onCheckmateSequenceComplete: () => void;
 }
 
-const DEFAULT_CAM_POS = new THREE.Vector3(0, 8.0, 9.2);
+const WHITE_CAM_POS = new THREE.Vector3(0, 8.0, 9.2);
+const BLACK_CAM_POS = new THREE.Vector3(0, 8.0, -9.2);
 const DEFAULT_TARGET = new THREE.Vector3(0, 0, 0);
 
 function CameraResetRig({
   resetSignal,
+  snapSignal,
+  targetCamPos,
   controlsRef,
   isCancelledRef,
 }: {
   resetSignal: number;
+  snapSignal: number;
+  targetCamPos: THREE.Vector3;
   controlsRef: RefObject<OrbitControlsHandle | null>;
   isCancelledRef: RefObject<boolean>;
 }) {
   const { camera } = useThree();
   const activeRef = useRef(false);
+
+  useEffect(() => {
+    if (snapSignal > 0) {
+      activeRef.current = false;
+      isCancelledRef.current = false;
+      camera.position.copy(targetCamPos);
+      if (controlsRef.current) {
+        controlsRef.current.target.copy(DEFAULT_TARGET);
+        controlsRef.current.update();
+      } else {
+        camera.lookAt(DEFAULT_TARGET);
+      }
+    }
+  }, [snapSignal, targetCamPos, camera, controlsRef, isCancelledRef]);
 
   useEffect(() => {
     if (resetSignal > 0) {
@@ -93,19 +118,19 @@ function CameraResetRig({
     const dt = Math.min(delta, 0.05);
     camera.position.x = THREE.MathUtils.damp(
       camera.position.x,
-      DEFAULT_CAM_POS.x,
+      targetCamPos.x,
       4.5,
       dt
     );
     camera.position.y = THREE.MathUtils.damp(
       camera.position.y,
-      DEFAULT_CAM_POS.y,
+      targetCamPos.y,
       4.5,
       dt
     );
     camera.position.z = THREE.MathUtils.damp(
       camera.position.z,
-      DEFAULT_CAM_POS.z,
+      targetCamPos.z,
       4.5,
       dt
     );
@@ -132,8 +157,8 @@ function CameraResetRig({
       controlsRef.current.update();
     }
 
-    if (camera.position.distanceTo(DEFAULT_CAM_POS) < 0.05) {
-      camera.position.copy(DEFAULT_CAM_POS);
+    if (camera.position.distanceTo(targetCamPos) < 0.05) {
+      camera.position.copy(targetCamPos);
       if (controlsRef.current) {
         controlsRef.current.target.copy(DEFAULT_TARGET);
         controlsRef.current.update();
@@ -147,6 +172,7 @@ function CameraResetRig({
 
 export function Scene3D({
   hasStarted,
+  perspectiveColor = 'w',
   pieces,
   status,
   selectedSquare,
@@ -156,8 +182,12 @@ export function Scene3D({
   isAnimating,
   isHumanTurn,
   isAiThinking,
+  isTutorEvaluating,
+  tutorWarning,
   isCheckmateSequenceActive,
   onSelectSquare,
+  onProceedTutorMove,
+  onUndoTutorMove,
   onAnimationComplete,
   onCheckmateSequenceComplete,
 }: Scene3DProps) {
@@ -167,6 +197,7 @@ export function Scene3D({
   const controlsRef = useRef<ComponentRef<typeof OrbitControls>>(null);
   const resetCancelledRef = useRef(false);
   const prevCheckmateActiveRef = useRef(false);
+  const prevPerspectiveRef = useRef<Color>(perspectiveColor);
   const burstCounterRef = useRef(0);
 
   const [debrisBursts, setDebrisBursts] = useState<DebrisBurstData[]>([]);
@@ -174,9 +205,18 @@ export function Scene3D({
   const [doorUnlocked, setDoorUnlocked] = useState(false);
   const [contextLost, setContextLost] = useState(false);
   const [cameraResetSignal, setCameraResetSignal] = useState(0);
+  const [cameraSnapSignal, setCameraSnapSignal] = useState(0);
   const canvasElRef = useRef<HTMLCanvasElement | null>(null);
 
   const softwareGl = useMemo(() => isSoftwareWebGL(), []);
+  const targetCamPos = perspectiveColor === 'b' ? BLACK_CAM_POS : WHITE_CAM_POS;
+
+  useEffect(() => {
+    if (prevPerspectiveRef.current !== perspectiveColor) {
+      prevPerspectiveRef.current = perspectiveColor;
+      setCameraSnapSignal((s) => s + 1);
+    }
+  }, [perspectiveColor]);
 
   // Reset leftover debris and smoothly restore camera when starting a new game
   useEffect(() => {
@@ -270,7 +310,12 @@ export function Scene3D({
         }
       : null;
 
-  const inputLocked = isAnimating || isAiThinking || !isHumanTurn;
+  const inputLocked =
+    isAnimating ||
+    isAiThinking ||
+    isTutorEvaluating ||
+    Boolean(tutorWarning) ||
+    !isHumanTurn;
 
   if (contextLost) {
     return (
@@ -406,8 +451,8 @@ export function Scene3D({
         maxDistance={13.2}
         minPolarAngle={Math.PI / 9}
         maxPolarAngle={Math.PI / 2.32}
-        minAzimuthAngle={-Math.PI / 2.6}
-        maxAzimuthAngle={Math.PI / 2.6}
+        minAzimuthAngle={perspectiveColor === 'b' ? -Infinity : -Math.PI / 2.6}
+        maxAzimuthAngle={perspectiveColor === 'b' ? Infinity : Math.PI / 2.6}
         onStart={() => {
           resetCancelledRef.current = true;
         }}
@@ -415,6 +460,8 @@ export function Scene3D({
 
       <CameraResetRig
         resetSignal={cameraResetSignal}
+        snapSignal={cameraSnapSignal}
+        targetCamPos={targetCamPos}
         controlsRef={controlsRef}
         isCancelledRef={resetCancelledRef}
       />
@@ -444,6 +491,10 @@ export function Scene3D({
           (isFriendly || Boolean(isCaptureTarget));
         const isInCheck =
           piece.type === 'k' && status.checkedSquare === piece.square;
+        const activeWarning =
+          tutorWarning && tutorWarning.from === piece.square
+            ? tutorWarning
+            : null;
 
         return (
           <ChessPiece3D
@@ -452,6 +503,9 @@ export function Scene3D({
             isSelected={selectedSquare === piece.square}
             isInCheck={isInCheck}
             canInteract={canInteract}
+            tutorWarning={activeWarning}
+            onProceedTutorMove={onProceedTutorMove}
+            onUndoTutorMove={onUndoTutorMove}
             onSelectSquare={onSelectSquare}
           />
         );

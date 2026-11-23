@@ -1,8 +1,13 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useFrame, type ThreeEvent } from '@react-three/fiber';
+import { Html } from '@react-three/drei';
 import type { Color, PieceSymbol, Square } from 'chess.js';
 import * as THREE from 'three';
-import { squareToWorldPosition, type BoardPiece } from '../game/chessTypes';
+import {
+  squareToWorldPosition,
+  type BoardPiece,
+  type PendingTutorWarning,
+} from '../game/chessTypes';
 import {
   getMarbleTextures,
   getObsidianTextures,
@@ -13,6 +18,9 @@ interface ChessPiece3DProps {
   isSelected: boolean;
   isInCheck?: boolean;
   canInteract: boolean;
+  tutorWarning?: PendingTutorWarning | null;
+  onProceedTutorMove?: () => void;
+  onUndoTutorMove?: () => void;
   onSelectSquare: (square: Square) => void;
 }
 
@@ -773,10 +781,14 @@ export function ChessPiece3D({
   isSelected,
   isInCheck = false,
   canInteract,
+  tutorWarning = null,
+  onProceedTutorMove,
+  onUndoTutorMove,
   onSelectSquare,
 }: ChessPiece3DProps) {
   const [hovered, setHovered] = useState(false);
   const idleRef = useRef<THREE.Group>(null);
+  const headShakeTimeRef = useRef<number | null>(null);
 
   const elevation = isSelected ? 0.18 : hovered && canInteract ? 0.05 : 0;
   const position = squareToWorldPosition(
@@ -791,9 +803,44 @@ export function ChessPiece3D({
     [piece.fileIndex, piece.rankIndex]
   );
 
-  useFrame(({ clock }) => {
+  useEffect(() => {
+    if (tutorWarning) {
+      headShakeTimeRef.current = 0;
+    } else {
+      headShakeTimeRef.current = null;
+    }
+  }, [tutorWarning]);
+
+  useFrame(({ clock }, delta) => {
     const g = idleRef.current;
     if (!g) return;
+
+    if (tutorWarning) {
+      const dt = Math.min(delta, 0.05);
+      headShakeTimeRef.current = (headShakeTimeRef.current ?? 0) + dt;
+      const cycleTime = headShakeTimeRef.current % 2.6;
+
+      if (cycleTime < 1.05) {
+        g.rotation.y =
+          Math.sin(cycleTime * 23) * Math.exp(-cycleTime * 2.1) * 0.45;
+        g.rotation.z =
+          Math.sin(cycleTime * 11.5) * Math.exp(-cycleTime * 2.2) * 0.08;
+        g.rotation.x = 0;
+        g.position.y =
+          Math.abs(Math.sin(cycleTime * 11.5)) *
+          Math.exp(-cycleTime * 2.0) *
+          0.04;
+      } else {
+        g.rotation.y *= 0.85;
+        g.rotation.z *= 0.85;
+        g.rotation.x = 0;
+        g.position.y *= 0.85;
+      }
+      return;
+    }
+
+    g.position.y = 0;
+    g.rotation.set(0, 0, 0);
     const t = clock.getElapsedTime() + phase;
 
     if (piece.type === 'p') {
@@ -814,6 +861,13 @@ export function ChessPiece3D({
       onSelectSquare(piece.square);
     }
   };
+
+  const bubbleY =
+    piece.type === 'k' || piece.type === 'q'
+      ? 1.78
+      : piece.type === 'p'
+        ? 1.38
+        : 1.58;
 
   return (
     <group
@@ -841,6 +895,50 @@ export function ChessPiece3D({
           isInCheck={isInCheck}
         />
       </group>
+
+      {tutorWarning && (
+        <Html
+          position={[0, bubbleY, 0]}
+          center
+          distanceFactor={9.5}
+          zIndexRange={[18, 2]}
+        >
+          <div
+            role="dialog"
+            aria-label="Tutor Mode Warning"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            className="relative w-48 select-none border border-[#c99b3b]/75 bg-[#0e131d]/96 px-3 py-2.5 text-center shadow-2xl"
+          >
+            <div className="text-xs font-semibold text-[#f3ede0]">
+              Are you sure?
+            </div>
+            <p className="mt-0.5 text-[11px] font-medium text-[#e5b85c]">
+              {tutorWarning.reason}
+            </p>
+            <div className="mt-2 flex items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={onProceedTutorMove}
+                className="cursor-pointer rounded bg-[#c99b3b] px-2.5 py-1 text-[11px] font-semibold text-[#14110b] transition-colors hover:bg-[#dcae4c] focus-visible:outline-2 focus-visible:outline-white whitespace-nowrap"
+              >
+                Proceed
+              </button>
+              <button
+                type="button"
+                onClick={onUndoTutorMove}
+                className="cursor-pointer rounded border border-white/20 bg-[#181e2c] px-2.5 py-1 text-[11px] font-medium text-[#e0e6f0] transition-colors hover:bg-[#242c40] focus-visible:outline-2 focus-visible:outline-[#e5b85c] whitespace-nowrap"
+              >
+                Undo
+              </button>
+            </div>
+            <div
+              className="pointer-events-none absolute -bottom-1.5 left-1/2 h-2.5 w-2.5 -translate-x-1/2 rotate-45 border-b border-r border-[#c99b3b]/75 bg-[#0e131d]"
+              aria-hidden="true"
+            />
+          </div>
+        </Html>
+      )}
     </group>
   );
 }

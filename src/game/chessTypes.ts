@@ -3,8 +3,54 @@ import type { Color, PieceSymbol, Square } from 'chess.js';
 export const FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] as const;
 export const TILE_SIZE = 1;
 
-export type GameMode = 'single' | 'local';
+export type GameMode = 'single' | 'local' | 'online';
 export type Difficulty = 'easy' | 'medium' | 'hard';
+export type ClockMinutes = 0 | 3 | 5 | 10;
+export type ClockIncrement = 0 | 2 | 5;
+
+export interface ClockConfig {
+  initialMinutes: ClockMinutes;
+  incrementSeconds: ClockIncrement;
+}
+
+export interface PlayerNames {
+  w: string;
+  b: string;
+}
+
+export interface MatchClockState {
+  enabled: boolean;
+  initialMs: number;
+  incrementMs: number;
+  remainingMs: {
+    w: number;
+    b: number;
+  };
+}
+
+export interface DrawOfferState {
+  offeredBy: Color;
+  status: 'pending' | 'declined';
+  message?: string;
+}
+
+export type MatchEndReason = 'resignation' | 'draw_agreement' | 'timeout';
+
+export interface MatchResolution {
+  winner: Color | null;
+  reason: MatchEndReason;
+  endedBy?: Color;
+}
+
+export interface MatchStateSnapshot {
+  names: PlayerNames;
+  humanColor: Color;
+  clockConfig: ClockConfig;
+  clocks: MatchClockState;
+  resignedBy: Color | null;
+  drawOffer: DrawOfferState | null;
+  resolution: MatchResolution | null;
+}
 
 export interface BoardPiece {
   id: string;
@@ -24,6 +70,16 @@ export interface PendingPromotion {
   from: Square;
   to: Square;
   color: Color;
+}
+
+export interface PendingTutorWarning {
+  from: Square;
+  to: Square;
+  promotion?: PromotionPiece;
+  pieceType: PieceSymbol;
+  pieceColor: Color;
+  cpLoss: number;
+  reason: string;
 }
 
 export type PromotionPiece = Exclude<PieceSymbol, 'p' | 'k'>;
@@ -46,6 +102,9 @@ export interface GameStatus {
     | 'threefold'
     | 'insufficient'
     | 'draw'
+    | 'resignation'
+    | 'draw_agreement'
+    | 'timeout'
     | null;
   checkedSquare: Square | null;
 }

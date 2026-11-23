@@ -7,6 +7,8 @@ export function App() {
     hasStarted,
     gameMode,
     difficulty,
+    tutorMode,
+    matchState,
     pieces,
     capturedPieces,
     status,
@@ -14,22 +16,51 @@ export function App() {
     legalTargets,
     lastMove,
     pendingPromotion,
+    pendingTutorWarning,
     activeAnimation,
     isAnimating,
     isAiThinking,
+    isTutorEvaluating,
+    isOfferDrawBusy,
     isHumanTurn,
+    localPlayerColor,
+    playerPerspectiveColor,
+    onlineRole,
+    onlineStatus,
+    onlineRoomCode,
+    onlineJoinCodeInput,
+    onlinePlayerName,
+    onlineError,
+    isRematchPending,
+    opponentEmote,
+    isEmoteOnCooldown,
     isCheckmateSequenceActive,
     checkmateTitleVisible,
     setGameMode,
     setDifficulty,
+    setTutorMode,
+    setLobbyNames,
+    setLobbyClockConfig,
+    setOnlineJoinCodeInput,
+    setOnlinePlayerName,
+    createOnlineGame,
+    joinOnlineGame,
+    cancelOnlineLobby,
     startGame,
     selectOrMoveSquare,
     executeVoiceCommand,
     confirmPromotion,
     cancelPromotion,
+    proceedTutorMove,
+    undoTutorMove,
     completeAnimation,
     completeCheckmateSequence,
+    resignGame,
+    offerDraw,
+    respondToDrawOffer,
+    sendEmote,
     resetGame,
+    rematchGame,
     returnToMenu,
   } = useChessGame();
 
@@ -37,6 +68,7 @@ export function App() {
     <main className="relative h-full w-full overflow-hidden bg-[#080c14]">
       <Scene3D
         hasStarted={hasStarted}
+        perspectiveColor={playerPerspectiveColor}
         pieces={pieces}
         status={status}
         selectedSquare={selectedSquare}
@@ -46,8 +78,12 @@ export function App() {
         isAnimating={isAnimating}
         isHumanTurn={isHumanTurn}
         isAiThinking={isAiThinking}
+        isTutorEvaluating={isTutorEvaluating}
+        tutorWarning={pendingTutorWarning}
         isCheckmateSequenceActive={isCheckmateSequenceActive}
         onSelectSquare={selectOrMoveSquare}
+        onProceedTutorMove={proceedTutorMove}
+        onUndoTutorMove={undoTutorMove}
         onAnimationComplete={completeAnimation}
         onCheckmateSequenceComplete={completeCheckmateSequence}
       />
@@ -55,20 +91,48 @@ export function App() {
         hasStarted={hasStarted}
         gameMode={gameMode}
         difficulty={difficulty}
+        tutorMode={tutorMode}
+        matchState={matchState}
         status={status}
         capturedPieces={capturedPieces}
         pendingPromotion={pendingPromotion}
         isAiThinking={isAiThinking}
+        isTutorEvaluating={isTutorEvaluating}
+        hasPendingTutorWarning={Boolean(pendingTutorWarning)}
+        isOfferDrawBusy={isOfferDrawBusy}
         isHumanTurn={isHumanTurn}
+        localPlayerColor={localPlayerColor}
+        onlineRole={onlineRole}
+        onlineStatus={onlineStatus}
+        onlineRoomCode={onlineRoomCode}
+        onlineJoinCodeInput={onlineJoinCodeInput}
+        onlinePlayerName={onlinePlayerName}
+        onlineError={onlineError}
+        isRematchPending={isRematchPending}
+        opponentEmote={opponentEmote}
+        isEmoteOnCooldown={isEmoteOnCooldown}
         isAnimating={isAnimating}
         checkmateTitleVisible={checkmateTitleVisible}
         onSelectMode={setGameMode}
         onSelectDifficulty={setDifficulty}
+        onToggleTutorMode={setTutorMode}
+        onUpdateLobbyNames={setLobbyNames}
+        onUpdateLobbyClock={setLobbyClockConfig}
+        onUpdateJoinCodeInput={setOnlineJoinCodeInput}
+        onUpdateOnlinePlayerName={setOnlinePlayerName}
+        onCreateOnlineGame={createOnlineGame}
+        onJoinOnlineGame={joinOnlineGame}
+        onCancelOnlineLobby={cancelOnlineLobby}
         onStartGame={startGame}
         onConfirmPromotion={confirmPromotion}
         onCancelPromotion={cancelPromotion}
         onVoiceCommand={executeVoiceCommand}
+        onResignGame={resignGame}
+        onOfferDraw={offerDraw}
+        onRespondDrawOffer={respondToDrawOffer}
+        onSendEmote={sendEmote}
         onResetGame={resetGame}
+        onRematchGame={rematchGame}
         onReturnToMenu={returnToMenu}
       />
     </main>
