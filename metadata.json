@@ -1,0 +1,8 @@
+{
+  "name": "Stonebound Gambit",
+  "description": "A 3D obsidian and marble chess duel set inside a flickering torchlit underground stone chamber.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
