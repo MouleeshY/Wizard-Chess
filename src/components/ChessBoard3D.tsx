@@ -1,4 +1,4 @@
-import { useMemo, type ReactElement } from 'react';
+import { useMemo, type ReactElement, type RefObject } from 'react';
 import type { ThreeEvent } from '@react-three/fiber';
 import type { Square } from 'chess.js';
 import {
@@ -21,6 +21,9 @@ interface ChessBoard3DProps {
   checkedSquare: Square | null;
   lastMove: LastMove | null;
   isAnimating: boolean;
+  dragHoverSquare?: Square | null;
+  isDraggingPiece?: boolean;
+  suppressClickUntilRef?: RefObject<number>;
   onSelectSquare: (square: Square) => void;
 }
 
@@ -30,6 +33,9 @@ export function ChessBoard3D({
   checkedSquare,
   lastMove,
   isAnimating,
+  dragHoverSquare = null,
+  isDraggingPiece = false,
+  suppressClickUntilRef,
   onSelectSquare,
 }: ChessBoard3DProps) {
   const marbleTex = useMemo(() => getMarbleTextures(), []);
@@ -47,6 +53,7 @@ export function ChessBoard3D({
 
       const isSelected = selectedSquare === square;
       const legalTarget = legalTargets.get(square);
+      const isDragHover = isDraggingPiece && dragHoverSquare === square;
       const isChecked = checkedSquare === square;
       const isLastMove =
         lastMove?.from === square || lastMove?.to === square;
@@ -59,9 +66,15 @@ export function ChessBoard3D({
       if (isChecked) {
         emissive = '#c81e1e';
         emissiveIntensity = 0.72;
+      } else if (isDragHover && legalTarget) {
+        emissive = legalTarget.isCapture ? '#ef5350' : '#f2c464';
+        emissiveIntensity = legalTarget.isCapture ? 0.78 : 0.75;
       } else if (isSelected) {
         emissive = '#d49a2a';
         emissiveIntensity = 0.5;
+      } else if (isDragHover) {
+        emissive = '#4a5e7a';
+        emissiveIntensity = 0.32;
       } else if (isLastMove) {
         emissive = '#386292';
         emissiveIntensity = 0.3;
@@ -69,6 +82,12 @@ export function ChessBoard3D({
 
       const handleClick = (e: ThreeEvent<MouseEvent>) => {
         e.stopPropagation();
+        if (
+          suppressClickUntilRef &&
+          performance.now() < suppressClickUntilRef.current
+        ) {
+          return;
+        }
         if (!isAnimating) {
           onSelectSquare(square);
         }
@@ -81,13 +100,15 @@ export function ChessBoard3D({
             receiveShadow
             onClick={handleClick}
             onPointerOver={(e) => {
-              if (!isAnimating && legalTarget) {
+              if (!isAnimating && !isDraggingPiece && legalTarget) {
                 e.stopPropagation();
                 document.body.style.cursor = 'pointer';
               }
             }}
             onPointerOut={() => {
-              document.body.style.cursor = 'auto';
+              if (!isDraggingPiece) {
+                document.body.style.cursor = 'auto';
+              }
             }}
           >
             <boxGeometry args={[tileVisualSize, 0.14, tileVisualSize]} />

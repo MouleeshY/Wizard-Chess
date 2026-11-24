@@ -30,6 +30,7 @@ import {
   evaluateMoveBlunder,
   evaluatePositionForDraw,
 } from './chessAI';
+import { buildMoveChoreography } from './movementCoordinator';
 import { parseVoiceCommand } from './voiceCommands';
 import { setCheckDroneState, unlockAudio } from '../utils/soundEffects';
 import {
@@ -223,8 +224,12 @@ function getStrikeStyle(pieceType: PieceSymbol): StrikeStyle {
   }
 }
 
-function buildMoveAnimation(move: Move, animId: number): ActiveMoveAnimation {
-  const slideDuration = 0.8;
+function buildMoveAnimation(
+  move: Move,
+  animId: number,
+  boardPiecesBefore: BoardPiece[],
+  isDragged = false
+): ActiveMoveAnimation {
   const primary = {
     type: move.piece,
     color: move.color,
@@ -242,6 +247,14 @@ function buildMoveAnimation(move: Move, animId: number): ActiveMoveAnimation {
       : move.to;
     const victimColor: Color = move.color === 'w' ? 'b' : 'w';
 
+    const capture = {
+      victimType: move.captured,
+      victimColor,
+      victimSquare,
+      victimCoords: squareToCoords(victimSquare),
+      strikeStyle: getStrikeStyle(move.piece),
+    };
+
     const promotion = move.promotion
       ? {
           newType: move.promotion as PromotionPiece,
@@ -251,20 +264,25 @@ function buildMoveAnimation(move: Move, animId: number): ActiveMoveAnimation {
         }
       : undefined;
 
+    const choreography = buildMoveChoreography({
+      kind: 'capture',
+      primary,
+      capture,
+      promotion,
+      boardPiecesBefore,
+      isDragged,
+    });
+
     return {
       id: animId,
       kind: 'capture',
       primary,
-      capture: {
-        victimType: move.captured,
-        victimColor,
-        victimSquare,
-        victimCoords: squareToCoords(victimSquare),
-        strikeStyle: getStrikeStyle(move.piece),
-      },
+      capture,
       promotion,
-      slideDuration,
-      totalDuration: promotion ? 2.08 : 1.25,
+      isDragged,
+      slideDuration: choreography.moveDuration,
+      totalDuration: choreography.totalDuration,
+      choreography,
     };
   }
 
@@ -275,46 +293,79 @@ function buildMoveAnimation(move: Move, animId: number): ActiveMoveAnimation {
     const rookFrom = (isKingside ? `h${rank}` : `a${rank}`) as Square;
     const rookTo = (isKingside ? `f${rank}` : `d${rank}`) as Square;
 
+    const secondary = {
+      type: 'r' as const,
+      color: move.color,
+      from: rookFrom,
+      to: rookTo,
+      fromCoords: squareToCoords(rookFrom),
+      toCoords: squareToCoords(rookTo),
+      isKnightHop: false,
+    };
+
+    const choreography = buildMoveChoreography({
+      kind: 'castle',
+      primary,
+      secondary,
+      boardPiecesBefore,
+      isDragged,
+    });
+
     return {
       id: animId,
       kind: 'castle',
       primary,
-      secondary: {
-        type: 'r',
-        color: move.color,
-        from: rookFrom,
-        to: rookTo,
-        fromCoords: squareToCoords(rookFrom),
-        toCoords: squareToCoords(rookTo),
-        isKnightHop: false,
-      },
-      slideDuration,
-      totalDuration: slideDuration,
+      secondary,
+      isDragged,
+      slideDuration: choreography.moveDuration,
+      totalDuration: choreography.totalDuration,
+      choreography,
     };
   }
 
   if (move.promotion) {
+    const promotion = {
+      newType: move.promotion as PromotionPiece,
+      color: move.color,
+      square: move.to,
+      coords: squareToCoords(move.to),
+    };
+
+    const choreography = buildMoveChoreography({
+      kind: 'promotion',
+      primary,
+      promotion,
+      boardPiecesBefore,
+      isDragged,
+    });
+
     return {
       id: animId,
       kind: 'promotion',
       primary,
-      promotion: {
-        newType: move.promotion as PromotionPiece,
-        color: move.color,
-        square: move.to,
-        coords: squareToCoords(move.to),
-      },
-      slideDuration,
-      totalDuration: 1.65,
+      promotion,
+      isDragged,
+      slideDuration: choreography.moveDuration,
+      totalDuration: choreography.totalDuration,
+      choreography,
     };
   }
+
+  const choreography = buildMoveChoreography({
+    kind: 'standard',
+    primary,
+    boardPiecesBefore,
+    isDragged,
+  });
 
   return {
     id: animId,
     kind: 'standard',
     primary,
-    slideDuration,
-    totalDuration: slideDuration,
+    isDragged,
+    slideDuration: choreography.moveDuration,
+    totalDuration: choreography.totalDuration,
+    choreography,
   };
 }
 
@@ -376,6 +427,11 @@ export function useChessGame() {
     useState<ActiveMoveAnimation | null>(null);
   const [isAiThinking, setIsAiThinking] = useState(false);
   const [isTutorEvaluating, setIsTutorEvaluating] = useState(false);
+  const [pendingTutorEval, setPendingTutorEval] = useState<{
+    from: Square;
+    to: Square;
+    isDragged: boolean;
+  } | null>(null);
   const [isOfferDrawBusy, setIsOfferDrawBusy] = useState(false);
   const [checkmateTitleVisible, setCheckmateTitleVisible] = useState(false);
 
@@ -403,6 +459,7 @@ export function useChessGame() {
     tutorAbortRef.current = null;
     setIsAiThinking(false);
     setIsTutorEvaluating(false);
+    setPendingTutorEval(null);
     setIsOfferDrawBusy(false);
     setSelectedSquare(null);
     setPendingPromotion(null);
@@ -582,10 +639,11 @@ export function useChessGame() {
       from: Square,
       to: Square,
       promotion?: PromotionPiece,
-      options?: { skipNetworkSend?: boolean }
+      options?: { skipNetworkSend?: boolean; isDragged?: boolean }
     ) => {
       if (resolutionRef.current) return;
       try {
+        const boardPiecesBefore = extractPieces(gameRef.current);
         const move = gameRef.current.move({ from, to, promotion });
         if (move) {
           if (gameRef.current.isCheck()) {
@@ -601,9 +659,17 @@ export function useChessGame() {
           setLastMove({ from: move.from, to: move.to });
           setSelectedSquare(null);
           setPendingPromotion(null);
+          setPendingTutorEval(null);
           setPendingTutorWarning(null);
           setCheckmateTitleVisible(false);
-          setActiveAnimation(buildMoveAnimation(move, animCounterRef.current));
+          setActiveAnimation(
+            buildMoveAnimation(
+              move,
+              animCounterRef.current,
+              boardPiecesBefore,
+              Boolean(options?.isDragged)
+            )
+          );
           setFenVersion((v) => v + 1);
 
           if (gameModeRef.current === 'online') {
@@ -655,18 +721,24 @@ export function useChessGame() {
   );
 
   const attemptHumanMove = useCallback(
-    (from: Square, to: Square, promotion?: PromotionPiece) => {
+    (
+      from: Square,
+      to: Square,
+      promotion?: PromotionPiece,
+      options?: { isDragged?: boolean }
+    ) => {
       if (resolutionRef.current) return;
+      const isDragged = Boolean(options?.isDragged);
 
       // Tutor Mode is strictly disabled in online games
       if (!tutorMode || gameModeRef.current === 'online') {
-        executeMove(from, to, promotion);
+        executeMove(from, to, promotion, { isDragged });
         return;
       }
 
       const piece = gameRef.current.get(from);
       if (!piece) {
-        executeMove(from, to, promotion);
+        executeMove(from, to, promotion, { isDragged });
         return;
       }
 
@@ -680,6 +752,7 @@ export function useChessGame() {
       setPendingPromotion(null);
       setSelectedSquare(from);
       setIsTutorEvaluating(true);
+      setPendingTutorEval({ from, to, isDragged });
 
       void evaluateMoveBlunder(
         fenBefore,
@@ -705,10 +778,11 @@ export function useChessGame() {
               pieceColor: piece.color,
               cpLoss: res.cpLoss,
               reason: res.reason,
+              isDragged,
             });
             setSelectedSquare(from);
           } else {
-            executeMove(from, to, promotion);
+            executeMove(from, to, promotion, { isDragged });
           }
         })
         .finally(() => {
@@ -717,6 +791,7 @@ export function useChessGame() {
           }
           if (epoch === matchEpochRef.current) {
             setIsTutorEvaluating(false);
+            setPendingTutorEval(null);
           }
         });
     },
@@ -732,9 +807,9 @@ export function useChessGame() {
     ) {
       return;
     }
-    const { from, to, promotion } = pendingTutorWarning;
+    const { from, to, promotion, isDragged } = pendingTutorWarning;
     setPendingTutorWarning(null);
-    executeMove(from, to, promotion);
+    executeMove(from, to, promotion, { isDragged: Boolean(isDragged) });
   }, [pendingTutorWarning, status.isGameOver, executeMove]);
 
   const undoTutorMove = useCallback(() => {
@@ -748,6 +823,7 @@ export function useChessGame() {
       tutorAbortRef.current?.abort();
       tutorAbortRef.current = null;
       setIsTutorEvaluating(false);
+      setPendingTutorEval(null);
       setPendingTutorWarning(null);
       return;
     }
@@ -756,6 +832,7 @@ export function useChessGame() {
       tutorAbortRef.current?.abort();
       tutorAbortRef.current = null;
       setIsTutorEvaluating(false);
+      setPendingTutorEval(null);
       setPendingTutorWarning(null);
     }
   }, []);
@@ -872,6 +949,100 @@ export function useChessGame() {
     ]
   );
 
+  const selectSquareForDrag = useCallback(
+    (square: Square) => {
+      unlockAudio();
+      const game = gameRef.current;
+      if (
+        !isHumanTurn ||
+        pendingPromotion ||
+        pendingTutorWarning ||
+        isTutorEvaluating ||
+        isAnimating ||
+        isAiThinking
+      ) {
+        return;
+      }
+
+      const piece = game.get(square);
+      if (
+        piece &&
+        piece.color === game.turn() &&
+        (gameMode !== 'online' || piece.color === localPlayerColor)
+      ) {
+        setSelectedSquare(square);
+      }
+    },
+    [
+      isHumanTurn,
+      gameMode,
+      localPlayerColor,
+      pendingPromotion,
+      pendingTutorWarning,
+      isTutorEvaluating,
+      isAnimating,
+      isAiThinking,
+    ]
+  );
+
+  const dropMove = useCallback(
+    (from: Square, to: Square): boolean => {
+      unlockAudio();
+      const game = gameRef.current;
+      if (
+        !isHumanTurn ||
+        pendingPromotion ||
+        pendingTutorWarning ||
+        isTutorEvaluating ||
+        isAnimating ||
+        isAiThinking
+      ) {
+        return false;
+      }
+
+      const piece = game.get(from);
+      if (
+        !piece ||
+        piece.color !== game.turn() ||
+        (gameMode === 'online' && piece.color !== localPlayerColor)
+      ) {
+        return false;
+      }
+
+      const legalMoves = game.moves({ square: from, verbose: true });
+      const matchingMoves = legalMoves.filter((m) => m.to === to);
+      if (matchingMoves.length === 0) {
+        return false;
+      }
+
+      const requiresPromotion = matchingMoves.some((m) => Boolean(m.promotion));
+      if (requiresPromotion) {
+        setSelectedSquare(from);
+        setPendingPromotion({
+          from,
+          to,
+          color: game.turn(),
+          isDragged: true,
+        });
+        return true;
+      }
+
+      attemptHumanMove(from, to, undefined, { isDragged: true });
+      return true;
+    },
+    [
+      isHumanTurn,
+      gameMode,
+      localPlayerColor,
+      pendingPromotion,
+      pendingTutorWarning,
+      isTutorEvaluating,
+      isAnimating,
+      isAiThinking,
+      attemptHumanMove,
+    ]
+  );
+
   const confirmPromotion = useCallback(
     (piece: PromotionPiece) => {
       unlockAudio();
@@ -885,7 +1056,9 @@ export function useChessGame() {
       ) {
         return;
       }
-      attemptHumanMove(pendingPromotion.from, pendingPromotion.to, piece);
+      attemptHumanMove(pendingPromotion.from, pendingPromotion.to, piece, {
+        isDragged: Boolean(pendingPromotion.isDragged),
+      });
     },
     [
       pendingPromotion,
@@ -989,6 +1162,7 @@ export function useChessGame() {
     setActiveAnimation(null);
     setIsAiThinking(false);
     setIsTutorEvaluating(false);
+    setPendingTutorEval(null);
     setIsOfferDrawBusy(false);
     setCheckmateTitleVisible(false);
     setFenVersion((v) => v + 1);
@@ -1403,6 +1577,7 @@ export function useChessGame() {
         tutorAbortRef.current?.abort();
         tutorAbortRef.current = null;
         setIsTutorEvaluating(false);
+        setPendingTutorEval(null);
         setPendingTutorWarning(null);
       }
       setGameModeState(mode);
@@ -1685,6 +1860,7 @@ export function useChessGame() {
     isAnimating,
     isAiThinking,
     isTutorEvaluating: gameMode === 'online' ? false : isTutorEvaluating,
+    pendingTutorEval: gameMode === 'online' ? null : pendingTutorEval,
     isOfferDrawBusy,
     isHumanTurn,
     localPlayerColor,
@@ -1712,6 +1888,8 @@ export function useChessGame() {
     cancelOnlineLobby,
     startGame,
     selectOrMoveSquare,
+    selectSquareForDrag,
+    dropMove,
     executeVoiceCommand,
     confirmPromotion,
     cancelPromotion,

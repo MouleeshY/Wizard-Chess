@@ -21,6 +21,7 @@ export function App() {
     isAnimating,
     isAiThinking,
     isTutorEvaluating,
+    pendingTutorEval,
     isOfferDrawBusy,
     isHumanTurn,
     localPlayerColor,
@@ -48,6 +49,8 @@ export function App() {
     cancelOnlineLobby,
     startGame,
     selectOrMoveSquare,
+    selectSquareForDrag,
+    dropMove,
     executeVoiceCommand,
     confirmPromotion,
     cancelPromotion,
@@ -79,9 +82,13 @@ export function App() {
         isHumanTurn={isHumanTurn}
         isAiThinking={isAiThinking}
         isTutorEvaluating={isTutorEvaluating}
+        pendingPromotion={pendingPromotion}
+        pendingTutorEval={pendingTutorEval}
         tutorWarning={pendingTutorWarning}
         isCheckmateSequenceActive={isCheckmateSequenceActive}
         onSelectSquare={selectOrMoveSquare}
+        onSelectSquareForDrag={selectSquareForDrag}
+        onDropMove={dropMove}
         onProceedTutorMove={proceedTutorMove}
         onUndoTutorMove={undoTutorMove}
         onAnimationComplete={completeAnimation}

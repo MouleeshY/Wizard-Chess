@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { useFrame, type ThreeEvent } from '@react-three/fiber';
 import { Html } from '@react-three/drei';
 import type { Color, PieceSymbol, Square } from 'chess.js';
@@ -9,18 +9,54 @@ import {
   type PendingTutorWarning,
 } from '../game/chessTypes';
 import {
+  lerpAngle,
+  sampleBystanderTransform,
+  sampleDefenderBraceTransform,
+  type BystanderMotionPlan,
+  type DefenderBracePlan,
+} from '../game/movementCoordinator';
+import {
   getMarbleTextures,
   getObsidianTextures,
 } from '../utils/proceduralTextures';
+
+export interface DragRuntimeState {
+  status: 'idle' | 'dragging' | 'returning';
+  square: Square | null;
+  pointerId: number | null;
+  startClientX: number;
+  startClientY: number;
+  hasMoved: boolean;
+  wasAlreadySelected: boolean;
+  currentX: number;
+  currentY: number;
+  currentZ: number;
+  targetX: number;
+  targetY: number;
+  targetZ: number;
+  returnStartX: number;
+  returnStartY: number;
+  returnStartZ: number;
+  returnProgress: number;
+}
 
 interface ChessPiece3DProps {
   piece: BoardPiece;
   isSelected: boolean;
   isInCheck?: boolean;
   canInteract: boolean;
+  canDrag?: boolean;
+  isDraggedPiece?: boolean;
+  dragRuntimeRef?: RefObject<DragRuntimeState>;
+  dragHoldPosition?: [number, number, number] | null;
+  suppressClickUntilRef?: RefObject<number>;
   tutorWarning?: PendingTutorWarning | null;
+  bystanderMotion?: BystanderMotionPlan | null;
+  defenderBrace?: DefenderBracePlan | null;
+  animationElapsedRef?: RefObject<number>;
   onProceedTutorMove?: () => void;
   onUndoTutorMove?: () => void;
+  onPiecePointerDown?: (square: Square, e: ThreeEvent<PointerEvent>) => void;
   onSelectSquare: (square: Square) => void;
 }
 
@@ -781,12 +817,22 @@ export function ChessPiece3D({
   isSelected,
   isInCheck = false,
   canInteract,
+  canDrag = false,
+  isDraggedPiece = false,
+  dragRuntimeRef,
+  dragHoldPosition = null,
+  suppressClickUntilRef,
   tutorWarning = null,
+  bystanderMotion = null,
+  defenderBrace = null,
+  animationElapsedRef,
   onProceedTutorMove,
   onUndoTutorMove,
+  onPiecePointerDown,
   onSelectSquare,
 }: ChessPiece3DProps) {
   const [hovered, setHovered] = useState(false);
+  const outerRef = useRef<THREE.Group>(null);
   const idleRef = useRef<THREE.Group>(null);
   const headShakeTimeRef = useRef<number | null>(null);
 
@@ -804,6 +850,12 @@ export function ChessPiece3D({
   );
 
   useEffect(() => {
+    if (isDraggedPiece) {
+      setHovered(false);
+    }
+  }, [isDraggedPiece]);
+
+  useEffect(() => {
     if (tutorWarning) {
       headShakeTimeRef.current = 0;
     } else {
@@ -812,8 +864,96 @@ export function ChessPiece3D({
   }, [tutorWarning]);
 
   useFrame(({ clock }, delta) => {
+    const outer = outerRef.current;
     const g = idleRef.current;
     if (!g) return;
+
+    const rt = dragRuntimeRef?.current;
+    if (outer && rt && rt.square === piece.square && rt.status === 'dragging') {
+      const dt = Math.min(delta, 0.05);
+      const followAlpha = 1 - Math.exp(-28 * dt);
+      rt.currentX = THREE.MathUtils.lerp(rt.currentX, rt.targetX, followAlpha);
+      rt.currentY = THREE.MathUtils.lerp(rt.currentY, rt.targetY, followAlpha);
+      rt.currentZ = THREE.MathUtils.lerp(rt.currentZ, rt.targetZ, followAlpha);
+      outer.position.set(rt.currentX, rt.currentY, rt.currentZ);
+      outer.rotation.set(0, rotationY, 0);
+
+      g.position.y = 0;
+      g.rotation.set(0, 0, 0);
+      return;
+    }
+
+    if (outer && rt && rt.square === piece.square && rt.status === 'returning') {
+      const dt = Math.min(delta, 0.05);
+      rt.returnProgress = Math.min(1, rt.returnProgress + dt / 0.18);
+      const ease = 1 - Math.pow(1 - rt.returnProgress, 3);
+      const rx = THREE.MathUtils.lerp(rt.returnStartX, position[0], ease);
+      const ry = THREE.MathUtils.lerp(rt.returnStartY, position[1], ease);
+      const rz = THREE.MathUtils.lerp(rt.returnStartZ, position[2], ease);
+      rt.currentX = rx;
+      rt.currentY = ry;
+      rt.currentZ = rz;
+      outer.position.set(rx, ry, rz);
+      outer.rotation.set(0, rotationY, 0);
+
+      if (rt.returnProgress >= 1) {
+        rt.status = 'idle';
+        rt.square = null;
+      }
+
+      g.position.y = 0;
+      g.rotation.set(0, 0, 0);
+      return;
+    }
+
+    if (outer) {
+      if (dragHoldPosition) {
+        outer.position.set(
+          dragHoldPosition[0],
+          dragHoldPosition[1],
+          dragHoldPosition[2]
+        );
+        outer.rotation.set(0, rotationY, 0);
+      } else if (defenderBrace && animationElapsedRef) {
+        const brace = sampleDefenderBraceTransform(
+          defenderBrace,
+          animationElapsedRef.current
+        );
+        outer.position.set(
+          position[0] + brace.worldOffsetX,
+          position[1],
+          position[2] + brace.worldOffsetZ
+        );
+        const yaw =
+          brace.targetYaw !== null
+            ? lerpAngle(rotationY, brace.targetYaw, brace.yawBlend)
+            : rotationY;
+        outer.rotation.set(0, yaw, 0);
+
+        g.position.set(0, brace.localOffsetY, 0);
+        g.rotation.set(brace.localRotX, 0, brace.localRotZ);
+        return;
+      } else if (bystanderMotion && animationElapsedRef) {
+        const bx = sampleBystanderTransform(
+          bystanderMotion,
+          animationElapsedRef.current
+        );
+        outer.position.set(
+          position[0] + bx.worldOffsetX,
+          position[1],
+          position[2] + bx.worldOffsetZ
+        );
+        outer.rotation.set(0, rotationY + bx.localTurnY, 0);
+
+        g.position.set(0, bx.localOffsetY, 0);
+        g.rotation.set(bx.localRotX, 0, bx.localRotZ);
+        return;
+      } else {
+        // Snap cleanly back to exact square center and facing when idle
+        outer.position.set(position[0], position[1], position[2]);
+        outer.rotation.set(0, rotationY, 0);
+      }
+    }
 
     if (tutorWarning) {
       const dt = Math.min(delta, 0.05);
@@ -857,6 +997,12 @@ export function ChessPiece3D({
 
   const handleClick = (e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
+    if (
+      suppressClickUntilRef &&
+      performance.now() < suppressClickUntilRef.current
+    ) {
+      return;
+    }
     if (canInteract) {
       onSelectSquare(piece.square);
     }
@@ -871,17 +1017,26 @@ export function ChessPiece3D({
 
   return (
     <group
-      position={position}
+      ref={outerRef}
+      position={dragHoldPosition ?? position}
       rotation={[0, rotationY, 0]}
+      onPointerDown={(e) => {
+        if (!canDrag) return;
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        e.stopPropagation();
+        onPiecePointerDown?.(piece.square, e);
+      }}
       onClick={handleClick}
       onPointerOver={(e) => {
+        if (isDraggedPiece) return;
         e.stopPropagation();
         if (canInteract) {
           setHovered(true);
-          document.body.style.cursor = 'pointer';
+          document.body.style.cursor = canDrag ? 'grab' : 'pointer';
         }
       }}
       onPointerOut={() => {
+        if (isDraggedPiece) return;
         setHovered(false);
         document.body.style.cursor = 'auto';
       }}
@@ -891,7 +1046,7 @@ export function ChessPiece3D({
           type={piece.type}
           color={piece.color}
           isSelected={isSelected}
-          isHovered={hovered && canInteract}
+          isHovered={hovered && canInteract && !isDraggedPiece}
           isInCheck={isInCheck}
         />
       </group>

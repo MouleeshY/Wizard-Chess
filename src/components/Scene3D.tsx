@@ -1,13 +1,14 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ComponentRef,
   type RefObject,
 } from 'react';
-import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { Canvas, useFrame, useThree, type ThreeEvent } from '@react-three/fiber';
 import { Environment, Lightformer, OrbitControls } from '@react-three/drei';
 import { Physics } from '@react-three/cannon';
 import {
@@ -19,17 +20,21 @@ import {
 import { ToneMappingMode } from 'postprocessing';
 import type { Color, Square } from 'chess.js';
 import * as THREE from 'three';
-import type {
-  ActiveMoveAnimation,
-  BoardPiece,
-  DebrisBurstData,
-  GameStatus,
-  LastMove,
-  LegalTarget,
-  PendingTutorWarning,
+import {
+  coordsToSquare,
+  squareToCoords,
+  squareToWorldPosition,
+  type ActiveMoveAnimation,
+  type BoardPiece,
+  type DebrisBurstData,
+  type GameStatus,
+  type LastMove,
+  type LegalTarget,
+  type PendingPromotion,
+  type PendingTutorWarning,
 } from '../game/chessTypes';
 import { ChessBoard3D } from './ChessBoard3D';
-import { ChessPiece3D } from './ChessPiece3D';
+import { ChessPiece3D, type DragRuntimeState } from './ChessPiece3D';
 import { StoneChamber3D } from './StoneChamber3D';
 import { DustBurstSystem, type DustBurstHandle } from './DustBurstSystem';
 import { CameraShakeRig, type CameraShakeHandle } from './CameraShakeRig';
@@ -45,6 +50,12 @@ import {
 } from './CheckmateSequence3D';
 import { isSoftwareWebGL } from '../utils/webglDetect';
 
+interface PendingTutorEvalInfo {
+  from: Square;
+  to: Square;
+  isDragged: boolean;
+}
+
 interface Scene3DProps {
   hasStarted: boolean;
   perspectiveColor?: Color;
@@ -58,9 +69,13 @@ interface Scene3DProps {
   isHumanTurn: boolean;
   isAiThinking: boolean;
   isTutorEvaluating: boolean;
+  pendingPromotion: PendingPromotion | null;
+  pendingTutorEval: PendingTutorEvalInfo | null;
   tutorWarning: PendingTutorWarning | null;
   isCheckmateSequenceActive: boolean;
   onSelectSquare: (square: Square) => void;
+  onSelectSquareForDrag: (square: Square) => void;
+  onDropMove: (from: Square, to: Square) => boolean;
   onProceedTutorMove: () => void;
   onUndoTutorMove: () => void;
   onAnimationComplete: (animationId: number) => void;
@@ -70,6 +85,216 @@ interface Scene3DProps {
 const WHITE_CAM_POS = new THREE.Vector3(0, 8.0, 9.2);
 const BLACK_CAM_POS = new THREE.Vector3(0, 8.0, -9.2);
 const DEFAULT_TARGET = new THREE.Vector3(0, 0, 0);
+const BOARD_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const _dragRaycaster = new THREE.Raycaster();
+const _dragNdc = new THREE.Vector2();
+const _dragPlaneHit = new THREE.Vector3();
+const DRAG_PIXEL_THRESHOLD = 5;
+
+function raycastBoardPlane(
+  clientX: number,
+  clientY: number,
+  camera: THREE.Camera,
+  domElement: HTMLElement
+): { square: Square | null; worldX: number; worldZ: number } | null {
+  const rect = domElement.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+
+  _dragNdc.set(
+    ((clientX - rect.left) / rect.width) * 2 - 1,
+    -((clientY - rect.top) / rect.height) * 2 + 1
+  );
+  _dragRaycaster.setFromCamera(_dragNdc, camera);
+  if (!_dragRaycaster.ray.intersectPlane(BOARD_PLANE, _dragPlaneHit)) {
+    return null;
+  }
+
+  const fileIndex = Math.floor(_dragPlaneHit.x + 4);
+  const rankIndex = Math.floor(4 - _dragPlaneHit.z);
+  const square =
+    fileIndex >= 0 && fileIndex <= 7 && rankIndex >= 0 && rankIndex <= 7
+      ? coordsToSquare(fileIndex, rankIndex)
+      : null;
+
+  return {
+    square,
+    worldX: THREE.MathUtils.clamp(_dragPlaneHit.x, -4.15, 4.15),
+    worldZ: THREE.MathUtils.clamp(_dragPlaneHit.z, -4.15, 4.15),
+  };
+}
+
+function computeDragHoldWorldPosition(
+  from: Square,
+  to: Square,
+  hasVictim: boolean
+): [number, number, number] {
+  const toCoords = squareToCoords(to);
+  const toPos = squareToWorldPosition(toCoords.fileIndex, toCoords.rankIndex, 0.28);
+  if (!hasVictim) {
+    return toPos;
+  }
+  const fromCoords = squareToCoords(from);
+  const fromPos = squareToWorldPosition(
+    fromCoords.fileIndex,
+    fromCoords.rankIndex,
+    0.28
+  );
+  const dx = fromPos[0] - toPos[0];
+  const dz = fromPos[2] - toPos[2];
+  const dist = Math.hypot(dx, dz) || 1;
+  const offset = Math.min(0.36, dist * 0.45);
+  return [
+    toPos[0] + (dx / dist) * offset,
+    0.28,
+    toPos[2] + (dz / dist) * offset,
+  ];
+}
+
+function createIdleDragState(): DragRuntimeState {
+  return {
+    status: 'idle',
+    square: null,
+    pointerId: null,
+    startClientX: 0,
+    startClientY: 0,
+    hasMoved: false,
+    wasAlreadySelected: false,
+    currentX: 0,
+    currentY: 0,
+    currentZ: 0,
+    targetX: 0,
+    targetY: 0,
+    targetZ: 0,
+    returnStartX: 0,
+    returnStartY: 0,
+    returnStartZ: 0,
+    returnProgress: 0,
+  };
+}
+
+function BoardDragController({
+  isDraggingPiece,
+  dragRuntimeRef,
+  onDragHoverChange,
+  onEndDragPointerUp,
+  onCancelDrag,
+}: {
+  isDraggingPiece: boolean;
+  dragRuntimeRef: RefObject<DragRuntimeState>;
+  onDragHoverChange: (square: Square | null) => void;
+  onEndDragPointerUp: (dropSquare: Square | null) => void;
+  onCancelDrag: (clearSelection: boolean) => void;
+}) {
+  const { camera, gl } = useThree();
+
+  const onDragHoverRef = useRef(onDragHoverChange);
+  onDragHoverRef.current = onDragHoverChange;
+  const onEndRef = useRef(onEndDragPointerUp);
+  onEndRef.current = onEndDragPointerUp;
+  const onCancelRef = useRef(onCancelDrag);
+  onCancelRef.current = onCancelDrag;
+
+  useEffect(() => {
+    if (!isDraggingPiece) return;
+
+    const handlePointerMove = (e: PointerEvent) => {
+      const rt = dragRuntimeRef.current;
+      if (rt.status !== 'dragging' || rt.pointerId !== e.pointerId) return;
+
+      const distPx = Math.hypot(
+        e.clientX - rt.startClientX,
+        e.clientY - rt.startClientY
+      );
+      if (!rt.hasMoved) {
+        if (distPx < DRAG_PIXEL_THRESHOLD) return;
+        rt.hasMoved = true;
+        document.body.style.cursor = 'grabbing';
+      }
+
+      const hit = raycastBoardPlane(e.clientX, e.clientY, camera, gl.domElement);
+      if (hit) {
+        rt.targetX = hit.worldX;
+        rt.targetY = 0.34;
+        rt.targetZ = hit.worldZ;
+        onDragHoverRef.current(hit.square);
+      } else {
+        onDragHoverRef.current(null);
+      }
+    };
+
+    const handlePointerUp = (e: PointerEvent) => {
+      const rt = dragRuntimeRef.current;
+      if (rt.status !== 'dragging' || rt.pointerId !== e.pointerId) return;
+
+      let dropSquare: Square | null = null;
+      if (rt.hasMoved) {
+        const hit = raycastBoardPlane(
+          e.clientX,
+          e.clientY,
+          camera,
+          gl.domElement
+        );
+        dropSquare = hit?.square ?? null;
+      }
+      onEndRef.current(dropSquare);
+    };
+
+    const handlePointerCancel = (e: PointerEvent) => {
+      const rt = dragRuntimeRef.current;
+      if (rt.status !== 'dragging' || rt.pointerId !== e.pointerId) return;
+      onCancelRef.current(false);
+    };
+
+    const handleWindowPointerDown = (e: PointerEvent) => {
+      const rt = dragRuntimeRef.current;
+      if (rt.status !== 'dragging') return;
+      if (e.button === 2) {
+        e.preventDefault();
+        onCancelRef.current(true);
+      }
+    };
+
+    const handleContextMenu = (e: MouseEvent) => {
+      if (dragRuntimeRef.current.status === 'dragging') {
+        e.preventDefault();
+        onCancelRef.current(true);
+      }
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && dragRuntimeRef.current.status === 'dragging') {
+        e.preventDefault();
+        onCancelRef.current(true);
+      }
+    };
+
+    const handleBlur = () => {
+      if (dragRuntimeRef.current.status === 'dragging') {
+        onCancelRef.current(false);
+      }
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerCancel);
+    window.addEventListener('pointerdown', handleWindowPointerDown, true);
+    window.addEventListener('contextmenu', handleContextMenu, true);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('blur', handleBlur);
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerCancel);
+      window.removeEventListener('pointerdown', handleWindowPointerDown, true);
+      window.removeEventListener('contextmenu', handleContextMenu, true);
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, [isDraggingPiece, camera, gl, dragRuntimeRef]);
+
+  return null;
+}
 
 function CameraResetRig({
   resetSignal,
@@ -170,6 +395,34 @@ function CameraResetRig({
   return null;
 }
 
+function MovementClockRunner({
+  activeAnimationId,
+  elapsedRef,
+}: {
+  activeAnimationId: number | null;
+  elapsedRef: RefObject<number>;
+}) {
+  const prevRenderIdRef = useRef<number | null>(null);
+  if (prevRenderIdRef.current !== activeAnimationId) {
+    prevRenderIdRef.current = activeAnimationId;
+    elapsedRef.current = 0;
+  }
+
+  useEffect(() => {
+    elapsedRef.current = 0;
+  }, [activeAnimationId, elapsedRef]);
+
+  useFrame((_, delta) => {
+    if (activeAnimationId === null) {
+      elapsedRef.current = 0;
+      return;
+    }
+    elapsedRef.current += Math.min(delta, 0.05);
+  });
+
+  return null;
+}
+
 export function Scene3D({
   hasStarted,
   perspectiveColor = 'w',
@@ -183,9 +436,13 @@ export function Scene3D({
   isHumanTurn,
   isAiThinking,
   isTutorEvaluating,
+  pendingPromotion,
+  pendingTutorEval,
   tutorWarning,
   isCheckmateSequenceActive,
   onSelectSquare,
+  onSelectSquareForDrag,
+  onDropMove,
   onProceedTutorMove,
   onUndoTutorMove,
   onAnimationComplete,
@@ -206,7 +463,22 @@ export function Scene3D({
   const [contextLost, setContextLost] = useState(false);
   const [cameraResetSignal, setCameraResetSignal] = useState(0);
   const [cameraSnapSignal, setCameraSnapSignal] = useState(0);
+  const [draggedSquare, setDraggedSquare] = useState<Square | null>(null);
+  const [dragHoverSquare, setDragHoverSquare] = useState<Square | null>(null);
+
   const canvasElRef = useRef<HTMLCanvasElement | null>(null);
+  const movementElapsedRef = useRef(0);
+  const dragRuntimeRef = useRef<DragRuntimeState>(createIdleDragState());
+  const suppressClickUntilRef = useRef(0);
+  const lastHeldRef = useRef<{
+    from: Square;
+    holdPos: [number, number, number];
+  } | null>(null);
+
+  const selectedSquareRef = useRef(selectedSquare);
+  selectedSquareRef.current = selectedSquare;
+  const legalTargetsRef = useRef(legalTargets);
+  legalTargetsRef.current = legalTargets;
 
   const softwareGl = useMemo(() => isSoftwareWebGL(), []);
   const targetCamPos = perspectiveColor === 'b' ? BLACK_CAM_POS : WHITE_CAM_POS;
@@ -317,6 +589,205 @@ export function Scene3D({
     Boolean(tutorWarning) ||
     !isHumanTurn;
 
+  const heldAtTarget = useMemo(() => {
+    const active = pendingPromotion?.isDragged
+      ? { from: pendingPromotion.from, to: pendingPromotion.to }
+      : pendingTutorEval?.isDragged
+        ? { from: pendingTutorEval.from, to: pendingTutorEval.to }
+        : tutorWarning?.isDragged
+          ? { from: tutorWarning.from, to: tutorWarning.to }
+          : null;
+    if (!active) return null;
+    const hasVictim = pieces.some((p) => p.square === active.to);
+    return {
+      from: active.from,
+      to: active.to,
+      holdPos: computeDragHoldWorldPosition(active.from, active.to, hasVictim),
+    };
+  }, [pendingPromotion, pendingTutorEval, tutorWarning, pieces]);
+
+  useLayoutEffect(() => {
+    if (activeAnimation) {
+      if (dragRuntimeRef.current.status !== 'idle') {
+        dragRuntimeRef.current.status = 'idle';
+        dragRuntimeRef.current.square = null;
+      }
+      lastHeldRef.current = null;
+      return;
+    }
+
+    if (lastHeldRef.current && !heldAtTarget) {
+      const prevHeld = lastHeldRef.current;
+      const rt = dragRuntimeRef.current;
+      rt.status = 'returning';
+      rt.square = prevHeld.from;
+      rt.pointerId = null;
+      rt.hasMoved = true;
+      rt.currentX = prevHeld.holdPos[0];
+      rt.currentY = prevHeld.holdPos[1];
+      rt.currentZ = prevHeld.holdPos[2];
+      rt.returnStartX = prevHeld.holdPos[0];
+      rt.returnStartY = prevHeld.holdPos[1];
+      rt.returnStartZ = prevHeld.holdPos[2];
+      rt.returnProgress = 0;
+      lastHeldRef.current = null;
+      return;
+    }
+
+    if (heldAtTarget) {
+      lastHeldRef.current = {
+        from: heldAtTarget.from,
+        holdPos: heldAtTarget.holdPos,
+      };
+    }
+  }, [activeAnimation, heldAtTarget]);
+
+  const finishDragSession = useCallback(
+    (restoreControls = true) => {
+      setDraggedSquare(null);
+      setDragHoverSquare(null);
+      document.body.style.cursor = 'auto';
+      suppressClickUntilRef.current = performance.now() + 80;
+      if (restoreControls && controlsRef.current && !isCheckmateSequenceActive) {
+        controlsRef.current.enabled = true;
+      }
+    },
+    [isCheckmateSequenceActive]
+  );
+
+  const handlePiecePointerDown = useCallback(
+    (square: Square, e: ThreeEvent<PointerEvent>) => {
+      if (
+        inputLocked ||
+        status.isGameOver ||
+        pendingPromotion ||
+        dragRuntimeRef.current.status === 'dragging'
+      ) {
+        return;
+      }
+
+      const piece = pieces.find((p) => p.square === square);
+      if (!piece) return;
+
+      const wasAlreadySelected = selectedSquareRef.current === square;
+      const homePos = squareToWorldPosition(
+        piece.fileIndex,
+        piece.rankIndex,
+        wasAlreadySelected ? 0.18 : 0
+      );
+
+      if (controlsRef.current) {
+        controlsRef.current.enabled = false;
+      }
+
+      const rt = dragRuntimeRef.current;
+      rt.status = 'dragging';
+      rt.square = square;
+      rt.pointerId = e.pointerId;
+      rt.startClientX = e.clientX;
+      rt.startClientY = e.clientY;
+      rt.hasMoved = false;
+      rt.wasAlreadySelected = wasAlreadySelected;
+      rt.currentX = homePos[0];
+      rt.currentY = homePos[1];
+      rt.currentZ = homePos[2];
+      rt.targetX = homePos[0];
+      rt.targetY = 0.24;
+      rt.targetZ = homePos[2];
+      rt.returnProgress = 0;
+
+      setDraggedSquare(square);
+      setDragHoverSquare(null);
+      onSelectSquareForDrag(square);
+    },
+    [inputLocked, status.isGameOver, pendingPromotion, pieces, onSelectSquareForDrag]
+  );
+
+  const handleEndDragPointerUp = useCallback(
+    (dropSquare: Square | null) => {
+      const rt = dragRuntimeRef.current;
+      if (rt.status !== 'dragging' || !rt.square) return;
+      const fromSquare = rt.square;
+
+      if (!rt.hasMoved) {
+        rt.status = 'returning';
+        rt.pointerId = null;
+        rt.returnStartX = rt.currentX;
+        rt.returnStartY = rt.currentY;
+        rt.returnStartZ = rt.currentZ;
+        rt.returnProgress = 0;
+        finishDragSession(true);
+        if (rt.wasAlreadySelected) {
+          onSelectSquare(fromSquare);
+        }
+        return;
+      }
+
+      if (
+        dropSquare &&
+        dropSquare !== fromSquare &&
+        legalTargetsRef.current.has(dropSquare)
+      ) {
+        const accepted = onDropMove(fromSquare, dropSquare);
+        if (accepted) {
+          rt.status = 'idle';
+          rt.square = null;
+          rt.pointerId = null;
+          finishDragSession(true);
+          return;
+        }
+      }
+
+      rt.status = 'returning';
+      rt.pointerId = null;
+      rt.returnStartX = rt.currentX;
+      rt.returnStartY = rt.currentY;
+      rt.returnStartZ = rt.currentZ;
+      rt.returnProgress = 0;
+      finishDragSession(true);
+    },
+    [finishDragSession, onSelectSquare, onDropMove]
+  );
+
+  const handleCancelDrag = useCallback(
+    (clearSelection: boolean) => {
+      const rt = dragRuntimeRef.current;
+      if (rt.status !== 'dragging' || !rt.square) return;
+      const fromSquare = rt.square;
+      rt.status = 'returning';
+      rt.pointerId = null;
+      rt.returnStartX = rt.currentX;
+      rt.returnStartY = rt.currentY;
+      rt.returnStartZ = rt.currentZ;
+      rt.returnProgress = 0;
+      finishDragSession(true);
+      if (clearSelection && selectedSquareRef.current === fromSquare) {
+        onSelectSquare(fromSquare);
+      }
+    },
+    [finishDragSession, onSelectSquare]
+  );
+
+  const handleDragHoverChange = useCallback((square: Square | null) => {
+    setDragHoverSquare((prev) => (prev === square ? prev : square));
+  }, []);
+
+  // Cancel active drag cleanly if input becomes locked or game ends mid-drag
+  useEffect(() => {
+    if (
+      draggedSquare &&
+      (inputLocked || status.isGameOver || Boolean(pendingPromotion))
+    ) {
+      handleCancelDrag(false);
+    }
+  }, [
+    draggedSquare,
+    inputLocked,
+    status.isGameOver,
+    pendingPromotion,
+    handleCancelDrag,
+  ]);
+
   if (contextLost) {
     return (
       <div className="flex h-full w-full items-center justify-center bg-[#080c14] p-6 text-center">
@@ -335,6 +806,7 @@ export function Scene3D({
 
   return (
     <Canvas
+      className="touch-none"
       shadows
       flat={!softwareGl}
       dpr={softwareGl ? 1 : [1, 2]}
@@ -351,7 +823,8 @@ export function Scene3D({
         canvasElRef.current = gl.domElement;
       }}
       onPointerMissed={() => {
-        if (!inputLocked && selectedSquare) {
+        if (performance.now() < suppressClickUntilRef.current) return;
+        if (!inputLocked && !draggedSquare && selectedSquare) {
           onSelectSquare(selectedSquare);
         }
       }}
@@ -438,12 +911,25 @@ export function Scene3D({
         />
       </mesh>
 
+      <MovementClockRunner
+        activeAnimationId={activeAnimation?.id ?? null}
+        elapsedRef={movementElapsedRef}
+      />
+
+      <BoardDragController
+        isDraggingPiece={draggedSquare !== null}
+        dragRuntimeRef={dragRuntimeRef}
+        onDragHoverChange={handleDragHoverChange}
+        onEndDragPointerUp={handleEndDragPointerUp}
+        onCancelDrag={handleCancelDrag}
+      />
+
       <CameraShakeRig ref={shakeRef} />
 
       <OrbitControls
         ref={controlsRef}
         makeDefault
-        enabled={!isCheckmateSequenceActive}
+        enabled={!isCheckmateSequenceActive && draggedSquare === null}
         enablePan={false}
         enableDamping={!softwareGl}
         dampingFactor={0.07}
@@ -477,6 +963,9 @@ export function Scene3D({
         checkedSquare={status.checkedSquare}
         lastMove={lastMove}
         isAnimating={inputLocked}
+        dragHoverSquare={dragHoverSquare}
+        isDraggingPiece={draggedSquare !== null}
+        suppressClickUntilRef={suppressClickUntilRef}
         onSelectSquare={onSelectSquare}
       />
 
@@ -489,12 +978,24 @@ export function Scene3D({
           !inputLocked &&
           !status.isGameOver &&
           (isFriendly || Boolean(isCaptureTarget));
+        const canDrag =
+          !inputLocked &&
+          !status.isGameOver &&
+          !pendingPromotion &&
+          isFriendly;
         const isInCheck =
           piece.type === 'k' && status.checkedSquare === piece.square;
         const activeWarning =
           tutorWarning && tutorWarning.from === piece.square
             ? tutorWarning
             : null;
+        const dragHoldPosition =
+          heldAtTarget && heldAtTarget.from === piece.square
+            ? heldAtTarget.holdPos
+            : null;
+
+        const bystanderMotion =
+          activeAnimation?.choreography.bystanders[piece.square] ?? null;
 
         return (
           <ChessPiece3D
@@ -503,9 +1004,17 @@ export function Scene3D({
             isSelected={selectedSquare === piece.square}
             isInCheck={isInCheck}
             canInteract={canInteract}
+            canDrag={canDrag}
+            isDraggedPiece={draggedSquare === piece.square}
+            dragRuntimeRef={dragRuntimeRef}
+            dragHoldPosition={dragHoldPosition}
+            suppressClickUntilRef={suppressClickUntilRef}
             tutorWarning={activeWarning}
+            bystanderMotion={bystanderMotion}
+            animationElapsedRef={movementElapsedRef}
             onProceedTutorMove={onProceedTutorMove}
             onUndoTutorMove={onUndoTutorMove}
+            onPiecePointerDown={handlePiecePointerDown}
             onSelectSquare={onSelectSquare}
           />
         );
@@ -517,6 +1026,10 @@ export function Scene3D({
           piece={victimToRender}
           isSelected={false}
           canInteract={false}
+          defenderBrace={
+            activeAnimation?.choreography.captureTiming?.defenderBrace ?? null
+          }
+          animationElapsedRef={movementElapsedRef}
           onSelectSquare={onSelectSquare}
         />
       )}
@@ -535,6 +1048,7 @@ export function Scene3D({
 
       <AnimatedMoveLayer
         animation={activeAnimation}
+        elapsedRef={movementElapsedRef}
         dustRef={dustRef}
         shakeRef={shakeRef}
         flashRef={flashRef}

@@ -6,6 +6,16 @@ import {
   squareToWorldPosition,
   type ActiveMoveAnimation,
 } from '../game/chessTypes';
+import {
+  clamp01,
+  easeInCubic,
+  easeOutCubic,
+  lerp,
+  lerpAngle,
+  sampleKnightLArc,
+  sampleLandingSquash,
+  sampleProceduralMotion,
+} from '../game/movementCoordinator';
 import { PieceGeometry } from './ChessPiece3D';
 import type { DustBurstHandle } from './DustBurstSystem';
 import type { CameraShakeHandle } from './CameraShakeRig';
@@ -18,6 +28,7 @@ import {
 
 interface AnimatedMoveLayerProps {
   animation: ActiveMoveAnimation | null;
+  elapsedRef: RefObject<number>;
   dustRef: RefObject<DustBurstHandle | null>;
   shakeRef: RefObject<CameraShakeHandle | null>;
   flashRef: RefObject<ImpactFlashHandle | null>;
@@ -30,51 +41,9 @@ interface AnimatedMoveLayerProps {
   onAnimationComplete: (animationId: number) => void;
 }
 
-const CAPTURE_APPROACH_END = 0.52;
-const CAPTURE_WINDUP_END = 0.78;
-const CAPTURE_IMPACT_TIME = 0.9;
-const CAPTURE_SETTLE_END = 1.25;
-
-function easeInOutCubic(t: number): number {
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-}
-
-function easeInCubic(t: number): number {
-  return t * t * t;
-}
-
-function easeOutCubic(t: number): number {
-  return 1 - Math.pow(1 - t, 3);
-}
-
-function lerpAngle(a: number, b: number, t: number): number {
-  const diff = Math.atan2(Math.sin(b - a), Math.cos(b - a));
-  return a + diff * t;
-}
-
-/** Smoothly bends a Knight hop along the long 2-square L-leg first before turning */
-function sampleKnightLArc(
-  fromX: number,
-  fromZ: number,
-  toX: number,
-  toZ: number,
-  easedT: number
-): [number, number] {
-  const dx = toX - fromX;
-  const dz = toZ - fromZ;
-  const longAlongX = Math.abs(dx) > Math.abs(dz);
-  const cornerX = longAlongX ? toX : fromX;
-  const cornerZ = longAlongX ? fromZ : toZ;
-
-  // Quadratic Bezier through the L-corner weighted toward the 2-square leg
-  const u = 1 - easedT;
-  const x = u * u * fromX + 2 * u * easedT * cornerX + easedT * easedT * toX;
-  const z = u * u * fromZ + 2 * u * easedT * cornerZ + easedT * easedT * toZ;
-  return [x, z];
-}
-
 export function AnimatedMoveLayer({
   animation,
+  elapsedRef,
   dustRef,
   shakeRef,
   flashRef,
@@ -85,28 +54,32 @@ export function AnimatedMoveLayer({
   const secondaryGroupRef = useRef<THREE.Group>(null);
   const promotedGroupRef = useRef<THREE.Group>(null);
 
-  const elapsedRef = useRef(0);
   const dustTimerRef = useRef(0);
+  const secondaryDustTimerRef = useRef(0);
+  const firedStepIndexRef = useRef(-1);
   const completedIdRef = useRef<number | null>(null);
-  const takeoffBurstIdRef = useRef<number | null>(null);
   const scrapeSoundIdRef = useRef<number | null>(null);
   const impactBurstIdRef = useRef<number | null>(null);
+  const landingBurstIdRef = useRef<number | null>(null);
+  const secondaryLandingBurstIdRef = useRef<number | null>(null);
   const riseBurstIdRef = useRef<number | null>(null);
+  const promoFinishIdRef = useRef<number | null>(null);
 
   useEffect(() => {
-    elapsedRef.current = 0;
     dustTimerRef.current = 0;
+    secondaryDustTimerRef.current = 0;
+    firedStepIndexRef.current = -1;
   }, [animation?.id]);
 
   useFrame((_, delta) => {
     if (!animation) return;
 
     const dt = Math.min(delta, 0.05);
-    elapsedRef.current += dt;
-    dustTimerRef.current += dt;
-
     const elapsed = elapsedRef.current;
+    dustTimerRef.current += dt;
+    secondaryDustTimerRef.current += dt;
 
+    const choreo = animation.choreography;
     const [pFromX, , pFromZ] = squareToWorldPosition(
       animation.primary.fromCoords.fileIndex,
       animation.primary.fromCoords.rankIndex
@@ -115,29 +88,32 @@ export function AnimatedMoveLayer({
       animation.primary.toCoords.fileIndex,
       animation.primary.toCoords.rankIndex
     );
-
     const baseFacingY = animation.primary.color === 'w' ? 0 : Math.PI;
 
+    // Trigger deterministic footfall dust & thuds along steps
+    while (
+      firedStepIndexRef.current + 1 < choreo.stepEvents.length &&
+      elapsed >= choreo.stepEvents[firedStepIndexRef.current + 1].time
+    ) {
+      firedStepIndexRef.current += 1;
+      const step = choreo.stepEvents[firedStepIndexRef.current];
+      if (step.dustCount > 0) {
+        dustRef.current?.emit(step.x, 0.035, step.z, step.dustCount, 0.24, 0.65);
+      }
+      if (step.thudVolume > 0) {
+        playStoneThud(step.thudVolume);
+      }
+      if (step.shakeIntensity > 0) {
+        shakeRef.current?.trigger(step.shakeIntensity, 0.16);
+      }
+    }
+
     // ------------------------------------------------------------------
-    // 1. DRAMATIC CAPTURE CHOREOGRAPHY (Approach -> Rearing Strike -> Shatter)
+    // 1. CAPTURE CHOREOGRAPHY (Bystanders Step -> Approach -> Brace & Windup -> Strike -> Shatter -> Settle)
     // ------------------------------------------------------------------
-    if (animation.kind === 'capture' && animation.capture) {
+    if (animation.kind === 'capture' && animation.capture && choreo.captureTiming) {
       const cap = animation.capture;
-      const [vX, , vZ] = squareToWorldPosition(
-        cap.victimCoords.fileIndex,
-        cap.victimCoords.rankIndex
-      );
-
-      const dx = vX - pFromX;
-      const dz = vZ - pFromZ;
-      const dist = Math.hypot(dx, dz) || 1;
-      const dirX = dx / dist;
-      const dirZ = dz / dist;
-
-      const standoff = Math.min(0.78, dist * 0.56);
-      const approachX = vX - dirX * standoff;
-      const approachZ = vZ - dirZ * standoff;
-      const attackYaw = Math.atan2(-dirX, -dirZ);
+      const ct = choreo.captureTiming;
 
       let px = pFromX;
       let py = 0;
@@ -145,164 +121,251 @@ export function AnimatedMoveLayer({
       let rotX = 0;
       let rotY = baseFacingY;
       let rotZ = 0;
+      let scaleX = 1;
+      let scaleY = 1;
+      let scaleZ = 1;
 
-      if (elapsed < CAPTURE_APPROACH_END) {
-        const t = elapsed / CAPTURE_APPROACH_END;
-        const e = easeInOutCubic(t);
+      if (elapsed < ct.approachStartTime) {
+        // Poised at origin while nearby bystanders step aside
+        px = pFromX;
+        pz = pFromZ;
+        rotY = lerpAngle(
+          baseFacingY,
+          ct.attackYaw,
+          easeOutCubic(clamp01(elapsed / Math.max(0.01, ct.approachStartTime))) * 0.25
+        );
+      } else if (elapsed < ct.approachEndTime) {
+        const approachDur = Math.max(0.01, ct.approachEndTime - ct.approachStartTime);
+        const t = (elapsed - ct.approachStartTime) / approachDur;
 
         if (animation.primary.isKnightHop) {
-          [px, pz] = sampleKnightLArc(pFromX, pFromZ, approachX, approachZ, e);
-          py = Math.sin(e * Math.PI) * 1.1;
+          const e = easeOutCubic(t);
+          [px, pz] = sampleKnightLArc(
+            pFromX,
+            pFromZ,
+            ct.approachX,
+            ct.approachZ,
+            e
+          );
+          py = Math.sin(e * Math.PI) * 1.05;
           rotX = Math.cos(e * Math.PI) * 0.36;
-          if (takeoffBurstIdRef.current !== animation.id) {
-            takeoffBurstIdRef.current = animation.id;
-            dustRef.current?.emit(pFromX, 0.04, pFromZ, 12, 0.26, 0.9);
-          }
+          rotY = lerpAngle(baseFacingY, ct.attackYaw, Math.min(t * 1.4, 1));
         } else {
-          px = THREE.MathUtils.lerp(pFromX, approachX, e);
-          pz = THREE.MathUtils.lerp(pFromZ, approachZ, e);
-          if (scrapeSoundIdRef.current !== animation.id) {
+          const approachDist = Math.hypot(ct.approachX - pFromX, ct.approachZ - pFromZ);
+          const pose = sampleProceduralMotion({
+            motion: animation.primary,
+            fromX: pFromX,
+            fromZ: pFromZ,
+            toX: ct.approachX,
+            toZ: ct.approachZ,
+            t,
+            dist: approachDist,
+          });
+          px = pose.x;
+          py = pose.y;
+          pz = pose.z;
+          rotX = pose.rotX;
+          rotZ = pose.rotZ;
+          scaleX = pose.scaleX;
+          scaleY = pose.scaleY;
+          scaleZ = pose.scaleZ;
+          rotY = lerpAngle(baseFacingY, ct.attackYaw, Math.min(t * 1.4, 1));
+
+          if (
+            (animation.primary.type === 'r' ||
+              animation.primary.type === 'b' ||
+              animation.primary.type === 'q') &&
+            scrapeSoundIdRef.current !== animation.id
+          ) {
             scrapeSoundIdRef.current = animation.id;
-            playStoneScrape(CAPTURE_APPROACH_END);
+            playStoneScrape(approachDur);
           }
         }
 
-        rotY = lerpAngle(baseFacingY, attackYaw, Math.min(t * 1.4, 1));
-
-        if (dustTimerRef.current >= 0.04) {
+        if (dustTimerRef.current >= 0.045) {
           dustTimerRef.current = 0;
-          if (!animation.primary.isKnightHop || t < 0.25 || t > 0.75) {
+          if (!animation.primary.isKnightHop || t < 0.22 || t > 0.78) {
             dustRef.current?.emit(px, 0.03, pz, 2, 0.2, 0.45);
           }
         }
-      } else if (elapsed < CAPTURE_WINDUP_END) {
-        // Rearing strike / wind-up specific to piece class
-        const t =
-          (elapsed - CAPTURE_APPROACH_END) /
-          (CAPTURE_WINDUP_END - CAPTURE_APPROACH_END);
+      } else if (elapsed < ct.windupEndTime) {
+        // Rearing strike / wind-up while defender braces
+        const windupDur = Math.max(0.01, ct.windupEndTime - ct.windupStartTime);
+        const t = (elapsed - ct.windupStartTime) / windupDur;
         const e = easeOutCubic(t);
-        rotY = attackYaw;
 
-        if (animation.primary.isKnightHop) {
-          // Dramatic Knight Rearing Strike (warhorse rears up onto hind legs!)
-          px = approachX - dirX * 0.12 * e;
-          pz = approachZ - dirZ * 0.12 * e;
-          py = 0.56 * e;
-          rotX = 0.62 * e;
-        } else if (cap.strikeStyle === 'slam') {
-          px = approachX - dirX * 0.14 * e;
-          pz = approachZ - dirZ * 0.14 * e;
-          py = 0.44 * e;
-          rotX = 0.32 * e;
-        } else if (cap.strikeStyle === 'sweep') {
-          px = approachX - dirX * 0.1 * e;
-          pz = approachZ - dirZ * 0.1 * e;
-          py = 0.16 * e;
-          rotY = attackYaw - 0.85 * e;
-          rotX = 0.2 * e;
-          rotZ = 0.26 * e;
+        if (animation.isDragged) {
+          rotY = lerpAngle(baseFacingY, ct.attackYaw, e);
+          const startY = 0.34;
+
+          if (animation.primary.isKnightHop) {
+            px = lerp(pToX, ct.approachX - ct.dirX * 0.12, e);
+            pz = lerp(pToZ, ct.approachZ - ct.dirZ * 0.12, e);
+            py = lerp(startY, 0.58, e);
+            rotX = 0.64 * e;
+          } else if (cap.strikeStyle === 'slam') {
+            px = lerp(pToX, ct.approachX - ct.dirX * 0.14, e);
+            pz = lerp(pToZ, ct.approachZ - ct.dirZ * 0.14, e);
+            py = lerp(startY, 0.44, e);
+            rotX = 0.34 * e;
+          } else if (cap.strikeStyle === 'sweep') {
+            px = lerp(pToX, ct.approachX - ct.dirX * 0.1, e);
+            pz = lerp(pToZ, ct.approachZ - ct.dirZ * 0.1, e);
+            py = lerp(startY, 0.16, e);
+            rotY = lerpAngle(baseFacingY, ct.attackYaw - 0.85, e);
+            rotX = 0.22 * e;
+            rotZ = 0.26 * e;
+          } else {
+            px = lerp(pToX, ct.approachX - ct.dirX * 0.2, e);
+            pz = lerp(pToZ, ct.approachZ - ct.dirZ * 0.2, e);
+            py = lerp(startY, 0.04, e);
+            rotX = 0.24 * e;
+          }
         } else {
-          px = approachX - dirX * 0.2 * e;
-          pz = approachZ - dirZ * 0.2 * e;
-          py = 0.04 * e;
-          rotX = 0.24 * e;
+          rotY = ct.attackYaw;
+
+          if (animation.primary.isKnightHop) {
+            px = ct.approachX - ct.dirX * 0.12 * e;
+            pz = ct.approachZ - ct.dirZ * 0.12 * e;
+            py = 0.58 * e;
+            rotX = 0.64 * e;
+          } else if (cap.strikeStyle === 'slam') {
+            px = ct.approachX - ct.dirX * 0.14 * e;
+            pz = ct.approachZ - ct.dirZ * 0.14 * e;
+            py = 0.44 * e;
+            rotX = 0.34 * e;
+          } else if (cap.strikeStyle === 'sweep') {
+            px = ct.approachX - ct.dirX * 0.1 * e;
+            pz = ct.approachZ - ct.dirZ * 0.1 * e;
+            py = 0.16 * e;
+            rotY = ct.attackYaw - 0.85 * e;
+            rotX = 0.22 * e;
+            rotZ = 0.26 * e;
+          } else {
+            px = ct.approachX - ct.dirX * 0.2 * e;
+            pz = ct.approachZ - ct.dirZ * 0.2 * e;
+            py = 0.04 * e;
+            rotX = 0.24 * e;
+          }
         }
-      } else if (elapsed < CAPTURE_IMPACT_TIME) {
-        // Snappy slam/strike into victim
-        const t =
-          (elapsed - CAPTURE_WINDUP_END) /
-          (CAPTURE_IMPACT_TIME - CAPTURE_WINDUP_END);
+      } else if (elapsed < ct.impactTime) {
+        // Snappy strike into bracing defender
+        const strikeDur = Math.max(0.01, ct.impactTime - ct.windupEndTime);
+        const t = (elapsed - ct.windupEndTime) / strikeDur;
         const e = easeInCubic(t);
-        rotY = attackYaw;
-
-        const strikeX = vX - dirX * 0.16;
-        const strikeZ = vZ - dirZ * 0.16;
+        rotY = ct.attackYaw;
 
         if (animation.primary.isKnightHop) {
-          px = THREE.MathUtils.lerp(approachX - dirX * 0.12, strikeX, e);
-          pz = THREE.MathUtils.lerp(approachZ - dirZ * 0.12, strikeZ, e);
-          py = THREE.MathUtils.lerp(0.56, 0.02, e);
-          rotX = THREE.MathUtils.lerp(0.62, -0.38, e);
+          px = lerp(ct.approachX - ct.dirX * 0.12, ct.strikeX, e);
+          pz = lerp(ct.approachZ - ct.dirZ * 0.12, ct.strikeZ, e);
+          py = lerp(0.58, 0.02, e);
+          rotX = lerp(0.64, -0.38, e);
         } else if (cap.strikeStyle === 'slam') {
-          px = THREE.MathUtils.lerp(approachX - dirX * 0.14, strikeX, e);
-          pz = THREE.MathUtils.lerp(approachZ - dirZ * 0.14, strikeZ, e);
-          py = THREE.MathUtils.lerp(0.44, 0.02, e);
-          rotX = THREE.MathUtils.lerp(0.32, -0.36, e);
+          px = lerp(ct.approachX - ct.dirX * 0.14, ct.strikeX, e);
+          pz = lerp(ct.approachZ - ct.dirZ * 0.14, ct.strikeZ, e);
+          py = lerp(0.44, 0.02, e);
+          rotX = lerp(0.34, -0.36, e);
         } else if (cap.strikeStyle === 'sweep') {
-          px = THREE.MathUtils.lerp(approachX - dirX * 0.1, strikeX, e);
-          pz = THREE.MathUtils.lerp(approachZ - dirZ * 0.1, strikeZ, e);
-          py = THREE.MathUtils.lerp(0.16, 0.03, e);
-          rotY = THREE.MathUtils.lerp(attackYaw - 0.85, attackYaw + 0.55, e);
-          rotX = THREE.MathUtils.lerp(0.2, -0.22, e);
-          rotZ = THREE.MathUtils.lerp(0.26, -0.24, e);
+          px = lerp(ct.approachX - ct.dirX * 0.1, ct.strikeX, e);
+          pz = lerp(ct.approachZ - ct.dirZ * 0.1, ct.strikeZ, e);
+          py = lerp(0.16, 0.03, e);
+          rotY = lerp(ct.attackYaw - 0.85, ct.attackYaw + 0.55, e);
+          rotX = lerp(0.22, -0.22, e);
+          rotZ = lerp(0.26, -0.24, e);
         } else {
-          px = THREE.MathUtils.lerp(approachX - dirX * 0.2, strikeX, e);
-          pz = THREE.MathUtils.lerp(approachZ - dirZ * 0.2, strikeZ, e);
-          py = THREE.MathUtils.lerp(0.04, 0.02, e);
-          rotX = THREE.MathUtils.lerp(0.24, -0.32, e);
+          px = lerp(ct.approachX - ct.dirX * 0.2, ct.strikeX, e);
+          pz = lerp(ct.approachZ - ct.dirZ * 0.2, ct.strikeZ, e);
+          py = lerp(0.04, 0.02, e);
+          rotX = lerp(0.24, -0.32, e);
         }
-      } else if (elapsed < CAPTURE_SETTLE_END) {
-        // Shatter impact once: heavy thud, shatter burst, flash, dust plume, camera shake
+      } else if (elapsed < ct.settleEndTime) {
+        // Shatter impact once
         if (impactBurstIdRef.current !== animation.id) {
           impactBurstIdRef.current = animation.id;
           playCaptureImpact();
           onCaptureImpact({
             victimSquare: cap.victimSquare,
             victimColor: cap.victimColor,
-            position: [vX, 0.08, vZ],
-            strikeDir: [dirX, dirZ],
+            position: [ct.victimX, 0.08, ct.victimZ],
+            strikeDir: [ct.dirX, ct.dirZ],
           });
-          flashRef.current?.trigger(vX, 0.12, vZ);
-          dustRef.current?.emit(vX, 0.06, vZ, 30, 0.45, 1.45);
-          shakeRef.current?.trigger(0.12, 0.44);
+          flashRef.current?.trigger(ct.victimX, 0.12, ct.victimZ);
+          dustRef.current?.emit(ct.victimX, 0.06, ct.victimZ, 30, 0.45, 1.45);
+          shakeRef.current?.trigger(
+            Math.max(0.08, choreo.primaryProfile.shakeIntensity * 1.25),
+            Math.max(0.34, choreo.primaryProfile.shakeDuration)
+          );
         }
 
-        const t =
-          (elapsed - CAPTURE_IMPACT_TIME) /
-          (CAPTURE_SETTLE_END - CAPTURE_IMPACT_TIME);
+        const settleDur = Math.max(0.01, ct.settleEndTime - ct.impactTime);
+        const t = (elapsed - ct.impactTime) / settleDur;
         const e = easeOutCubic(t);
-        const strikeX = vX - dirX * 0.16;
-        const strikeZ = vZ - dirZ * 0.16;
 
-        px = THREE.MathUtils.lerp(strikeX, pToX, e);
-        pz = THREE.MathUtils.lerp(strikeZ, pToZ, e);
+        px = lerp(ct.strikeX, pToX, e);
+        pz = lerp(ct.strikeZ, pToZ, e);
         py = 0;
 
         if (animation.primary.isKnightHop) {
-          rotX = THREE.MathUtils.lerp(-0.38, 0, e);
-          rotY = lerpAngle(attackYaw, baseFacingY, e);
+          rotX = lerp(-0.38, 0, e);
+          rotY = lerpAngle(ct.attackYaw, baseFacingY, e);
         } else if (cap.strikeStyle === 'slam') {
-          rotX = THREE.MathUtils.lerp(-0.36, 0, e);
-          rotY = lerpAngle(attackYaw, baseFacingY, e);
+          rotX = lerp(-0.36, 0, e);
+          rotY = lerpAngle(ct.attackYaw, baseFacingY, e);
         } else if (cap.strikeStyle === 'sweep') {
-          rotX = THREE.MathUtils.lerp(-0.22, 0, e);
-          rotY = lerpAngle(attackYaw + 0.55, baseFacingY, e);
-          rotZ = THREE.MathUtils.lerp(-0.24, 0, e);
+          rotX = lerp(-0.22, 0, e);
+          rotY = lerpAngle(ct.attackYaw + 0.55, baseFacingY, e);
+          rotZ = lerp(-0.24, 0, e);
         } else {
-          rotX = THREE.MathUtils.lerp(-0.32, 0, e);
-          rotY = lerpAngle(attackYaw, baseFacingY, e);
+          rotX = lerp(-0.32, 0, e);
+          rotY = lerpAngle(ct.attackYaw, baseFacingY, e);
         }
+
+        const impactSquash = sampleLandingSquash(
+          elapsed,
+          ct.impactTime,
+          choreo.primaryProfile.landingSquash
+        );
+        scaleX = impactSquash.scaleX;
+        scaleY = impactSquash.scaleY;
+        scaleZ = impactSquash.scaleZ;
       } else {
-        // Post-capture promotion phase
+        // Settled onto target square (plus optional capture-promotion)
         px = pToX;
         pz = pToZ;
         rotY = baseFacingY;
 
-        if (animation.promotion) {
-          const sinkStart = CAPTURE_SETTLE_END;
-          const sinkDuration = 0.4;
-          const riseStart = CAPTURE_SETTLE_END + 0.3;
-          const riseDuration = 0.53;
+        if (landingBurstIdRef.current !== animation.id) {
+          landingBurstIdRef.current = animation.id;
+          playStoneThud(choreo.primaryProfile.landingThudVolume * 0.8);
+          dustRef.current?.emit(pToX, 0.035, pToZ, 8, 0.24, 0.65);
+        }
 
-          const sinkT = Math.min((elapsed - sinkStart) / sinkDuration, 1);
+        const sq = sampleLandingSquash(
+          elapsed,
+          choreo.landingTime,
+          choreo.primaryProfile.landingSquash * 0.75
+        );
+        scaleX = sq.scaleX;
+        scaleY = sq.scaleY;
+        scaleZ = sq.scaleZ;
+
+        if (animation.promotion && choreo.promotionTiming) {
+          const pt = choreo.promotionTiming;
+          const sinkT = clamp01(
+            (elapsed - pt.sinkStartTime) /
+              Math.max(0.01, pt.sinkEndTime - pt.sinkStartTime)
+          );
           py = -0.95 * easeInCubic(sinkT);
           if (primaryGroupRef.current) {
             primaryGroupRef.current.visible = sinkT < 1;
           }
 
           if (promotedGroupRef.current) {
-            if (elapsed >= riseStart) {
-              const riseT = Math.min((elapsed - riseStart) / riseDuration, 1);
+            if (elapsed >= pt.riseStartTime) {
+              const riseT = clamp01(
+                (elapsed - pt.riseStartTime) /
+                  Math.max(0.01, pt.riseEndTime - pt.riseStartTime)
+              );
               const riseY = -1.45 * (1 - easeOutCubic(riseT));
               promotedGroupRef.current.visible = true;
               promotedGroupRef.current.position.set(pToX, riseY, pToZ);
@@ -310,6 +373,12 @@ export function AnimatedMoveLayer({
               if (riseBurstIdRef.current !== animation.id) {
                 riseBurstIdRef.current = animation.id;
                 dustRef.current?.emit(pToX, 0.05, pToZ, 14, 0.32, 1.05);
+              }
+              if (riseT >= 1 && promoFinishIdRef.current !== animation.id) {
+                promoFinishIdRef.current = animation.id;
+                playStoneThud(0.65);
+                dustRef.current?.emit(pToX, 0.04, pToZ, 12, 0.3, 0.75);
+                shakeRef.current?.trigger(0.06, 0.32);
               }
             } else {
               promotedGroupRef.current.visible = false;
@@ -319,70 +388,103 @@ export function AnimatedMoveLayer({
       }
 
       if (primaryGroupRef.current) {
+        primaryGroupRef.current.rotation.order = 'YXZ';
         primaryGroupRef.current.position.set(px, py, pz);
         primaryGroupRef.current.rotation.set(rotX, rotY, rotZ);
+        primaryGroupRef.current.scale.set(scaleX, scaleY, scaleZ);
       }
 
       if (
-        elapsed >= animation.totalDuration &&
+        elapsed >= choreo.totalDuration &&
         completedIdRef.current !== animation.id
       ) {
         completedIdRef.current = animation.id;
-        if (animation.promotion) {
-          playStoneThud(0.55);
-          dustRef.current?.emit(pToX, 0.04, pToZ, 12, 0.3, 0.75);
-          shakeRef.current?.trigger(0.055, 0.32);
-        }
         onAnimationComplete(animation.id);
       }
       return;
     }
 
     // ------------------------------------------------------------------
-    // 2. NON-CAPTURE MOVES (SLIDE, KNIGHT L-LEAP, CASTLING, PROMOTION)
+    // 2. NON-CAPTURE MOVES (PROCEDURAL PER-PIECE PROFILES, CASTLING, PROMOTION)
     // ------------------------------------------------------------------
-    const slideT = Math.min(elapsed / animation.slideDuration, 1);
-    const easedSlide = easeInOutCubic(slideT);
+    const moveT =
+      choreo.moveDuration > 0
+        ? clamp01((elapsed - choreo.moveStartTime) / choreo.moveDuration)
+        : 1;
+    const primaryDist = Math.hypot(pToX - pFromX, pToZ - pFromZ);
 
-    let px = THREE.MathUtils.lerp(pFromX, pToX, easedSlide);
-    let pz = THREE.MathUtils.lerp(pFromZ, pToZ, easedSlide);
+    let px = pFromX;
     let py = 0;
+    let pz = pFromZ;
     let rotX = 0;
     let rotY = baseFacingY;
+    let rotZ = 0;
+    let scaleX = 1;
+    let scaleY = 1;
+    let scaleZ = 1;
 
-    if (animation.primary.isKnightHop) {
-      [px, pz] = sampleKnightLArc(pFromX, pFromZ, pToX, pToZ, easedSlide);
-      py = Math.sin(easedSlide * Math.PI) * 1.32;
-      // Rearing pitch on takeoff, forward dive into landing
-      rotX = Math.cos(easedSlide * Math.PI) * 0.42;
+    if (animation.isDragged) {
+      const dropT =
+        choreo.landingTime > 0
+          ? clamp01(elapsed / choreo.landingTime)
+          : 1;
+      px = pToX;
+      pz = pToZ;
+      py = dropT < 1 ? 0.34 * (1 - easeInCubic(dropT)) : 0;
+    } else if (elapsed < choreo.moveStartTime) {
+      px = pFromX;
+      pz = pFromZ;
+    } else {
+      const pose = sampleProceduralMotion({
+        motion: animation.primary,
+        fromX: pFromX,
+        fromZ: pFromZ,
+        toX: pToX,
+        toZ: pToZ,
+        t: moveT,
+        dist: primaryDist,
+      });
+      px = pose.x;
+      py = pose.y;
+      pz = pose.z;
+      rotX = pose.rotX;
+      rotY = pose.rotY;
+      rotZ = pose.rotZ;
+      scaleX = pose.scaleX;
+      scaleY = pose.scaleY;
+      scaleZ = pose.scaleZ;
 
-      const hopDirX = pToX - px;
-      const hopDirZ = pToZ - pz;
-      if (Math.hypot(hopDirX, hopDirZ) > 0.08 && slideT < 0.85) {
-        const travelYaw = Math.atan2(-hopDirX, -hopDirZ);
-        rotY = lerpAngle(baseFacingY, travelYaw, Math.sin(slideT * Math.PI) * 0.75);
+      if (
+        (animation.primary.type === 'r' ||
+          animation.primary.type === 'b' ||
+          animation.primary.type === 'q') &&
+        scrapeSoundIdRef.current !== animation.id
+      ) {
+        scrapeSoundIdRef.current = animation.id;
+        playStoneScrape(choreo.moveDuration * 0.92);
       }
 
-      if (takeoffBurstIdRef.current !== animation.id) {
-        takeoffBurstIdRef.current = animation.id;
-        dustRef.current?.emit(pFromX, 0.04, pFromZ, 12, 0.28, 0.92);
+      if (
+        moveT < 0.96 &&
+        !animation.primary.isKnightHop &&
+        (animation.primary.type === 'r' ||
+          animation.primary.type === 'b' ||
+          animation.primary.type === 'q') &&
+        dustTimerRef.current >= 0.04
+      ) {
+        dustTimerRef.current = 0;
+        dustRef.current?.emit(
+          px,
+          0.03,
+          pz,
+          animation.primary.type === 'r' ? 3 : 2,
+          0.22,
+          0.48
+        );
       }
-    } else if (scrapeSoundIdRef.current !== animation.id) {
-      scrapeSoundIdRef.current = animation.id;
-      playStoneScrape(animation.slideDuration * 0.9);
     }
 
-    if (slideT < 0.96 && dustTimerRef.current >= 0.035) {
-      dustTimerRef.current = 0;
-      if (animation.primary.isKnightHop) {
-        if (slideT < 0.22 || slideT > 0.78) {
-          dustRef.current?.emit(px, 0.04, pz, 2, 0.18, 0.45);
-        }
-      } else {
-        dustRef.current?.emit(px, 0.03, pz, 3, 0.22, 0.5);
-      }
-    }
-
+    // Castling secondary rook motion
     if (animation.secondary && secondaryGroupRef.current) {
       const [sFromX, , sFromZ] = squareToWorldPosition(
         animation.secondary.fromCoords.fileIndex,
@@ -392,23 +494,123 @@ export function AnimatedMoveLayer({
         animation.secondary.toCoords.fileIndex,
         animation.secondary.toCoords.rankIndex
       );
-      const sx = THREE.MathUtils.lerp(sFromX, sToX, easedSlide);
-      const sz = THREE.MathUtils.lerp(sFromZ, sToZ, easedSlide);
-      secondaryGroupRef.current.position.set(sx, 0, sz);
+      const secDist = Math.hypot(sToX - sFromX, sToZ - sFromZ);
 
-      if (slideT < 0.96 && Math.random() < 0.45) {
-        dustRef.current?.emit(sx, 0.03, sz, 2, 0.22, 0.48);
+      let secPose = {
+        x: sFromX,
+        y: 0,
+        z: sFromZ,
+        rotX: 0,
+        rotY: animation.secondary.color === 'w' ? 0 : Math.PI,
+        rotZ: 0,
+        scaleX: 1,
+        scaleY: 1,
+        scaleZ: 1,
+      };
+
+      if (elapsed >= choreo.moveStartTime) {
+        secPose = sampleProceduralMotion({
+          motion: animation.secondary,
+          fromX: sFromX,
+          fromZ: sFromZ,
+          toX: sToX,
+          toZ: sToZ,
+          t: moveT,
+          dist: secDist,
+        });
+      }
+
+      const secLandingTime = animation.isDragged
+        ? choreo.moveEndTime
+        : choreo.landingTime;
+      const secSq = sampleLandingSquash(
+        elapsed,
+        secLandingTime,
+        choreo.secondaryProfile?.landingSquash ?? 0.1
+      );
+      secondaryGroupRef.current.rotation.order = 'YXZ';
+      secondaryGroupRef.current.position.set(secPose.x, secPose.y, secPose.z);
+      secondaryGroupRef.current.rotation.set(
+        secPose.rotX,
+        secPose.rotY,
+        secPose.rotZ
+      );
+      secondaryGroupRef.current.scale.set(
+        secPose.scaleX * secSq.scaleX,
+        secPose.scaleY * secSq.scaleY,
+        secPose.scaleZ * secSq.scaleZ
+      );
+
+      if (
+        elapsed >= choreo.moveStartTime &&
+        moveT < 0.96 &&
+        secondaryDustTimerRef.current >= 0.045
+      ) {
+        secondaryDustTimerRef.current = 0;
+        dustRef.current?.emit(secPose.x, 0.03, secPose.z, 2, 0.22, 0.45);
+      }
+
+      if (
+        animation.isDragged &&
+        elapsed >= secLandingTime &&
+        secondaryLandingBurstIdRef.current !== animation.id
+      ) {
+        secondaryLandingBurstIdRef.current = animation.id;
+        playStoneThud(choreo.secondaryProfile?.landingThudVolume ?? 0.48);
+        dustRef.current?.emit(sToX, 0.04, sToZ, 12, 0.28, 0.8);
       }
     }
 
-    if (animation.kind === 'promotion' && animation.promotion) {
-      const sinkStart = 0.8;
-      const sinkDuration = 0.42;
-      const riseStart = 1.12;
-      const riseDuration = 0.53;
+    // Landing impact event (thud, dust puff, weight-scaled camera shake)
+    if (elapsed >= choreo.landingTime && landingBurstIdRef.current !== animation.id) {
+      landingBurstIdRef.current = animation.id;
 
-      if (elapsed >= sinkStart) {
-        const sinkT = Math.min((elapsed - sinkStart) / sinkDuration, 1);
+      playStoneThud(choreo.primaryProfile.landingThudVolume);
+
+      const dustCount = Math.round(8 + choreo.primaryProfile.weight * 12);
+      dustRef.current?.emit(
+        pToX,
+        0.04,
+        pToZ,
+        dustCount,
+        0.3,
+        0.6 + choreo.primaryProfile.weight * 0.5
+      );
+
+      if (animation.secondary && !animation.isDragged) {
+        const [sToX, , sToZ] = squareToWorldPosition(
+          animation.secondary.toCoords.fileIndex,
+          animation.secondary.toCoords.rankIndex
+        );
+        dustRef.current?.emit(sToX, 0.04, sToZ, 12, 0.28, 0.8);
+      }
+
+      shakeRef.current?.trigger(
+        choreo.primaryProfile.shakeIntensity,
+        choreo.primaryProfile.shakeDuration
+      );
+    }
+
+    // Apply post-landing squash for non-Knight pieces (or dragged Knights settling onto square)
+    if (animation.isDragged || !animation.primary.isKnightHop) {
+      const sq = sampleLandingSquash(
+        elapsed,
+        choreo.landingTime,
+        choreo.primaryProfile.landingSquash
+      );
+      scaleX *= sq.scaleX;
+      scaleY *= sq.scaleY;
+      scaleZ *= sq.scaleZ;
+    }
+
+    // Promotion sink & rise phase
+    if (animation.kind === 'promotion' && animation.promotion && choreo.promotionTiming) {
+      const pt = choreo.promotionTiming;
+      if (elapsed >= pt.sinkStartTime) {
+        const sinkT = clamp01(
+          (elapsed - pt.sinkStartTime) /
+            Math.max(0.01, pt.sinkEndTime - pt.sinkStartTime)
+        );
         py = -0.95 * easeInCubic(sinkT);
         if (primaryGroupRef.current) {
           primaryGroupRef.current.visible = sinkT < 1;
@@ -420,8 +622,11 @@ export function AnimatedMoveLayer({
       }
 
       if (promotedGroupRef.current) {
-        if (elapsed >= riseStart) {
-          const riseT = Math.min((elapsed - riseStart) / riseDuration, 1);
+        if (elapsed >= pt.riseStartTime) {
+          const riseT = clamp01(
+            (elapsed - pt.riseStartTime) /
+              Math.max(0.01, pt.riseEndTime - pt.riseStartTime)
+          );
           const riseY = -1.45 * (1 - easeOutCubic(riseT));
           promotedGroupRef.current.visible = true;
           promotedGroupRef.current.position.set(pToX, riseY, pToZ);
@@ -433,6 +638,13 @@ export function AnimatedMoveLayer({
             dustTimerRef.current = 0;
             dustRef.current?.emit(pToX, 0.04, pToZ, 2, 0.24, 0.75);
           }
+
+          if (riseT >= 1 && promoFinishIdRef.current !== animation.id) {
+            promoFinishIdRef.current = animation.id;
+            playStoneThud(0.65);
+            dustRef.current?.emit(pToX, 0.04, pToZ, 12, 0.3, 0.75);
+            shakeRef.current?.trigger(0.06, 0.32);
+          }
         } else {
           promotedGroupRef.current.visible = false;
         }
@@ -440,39 +652,17 @@ export function AnimatedMoveLayer({
     }
 
     if (primaryGroupRef.current) {
+      primaryGroupRef.current.rotation.order = 'YXZ';
       primaryGroupRef.current.position.set(px, py, pz);
-      primaryGroupRef.current.rotation.set(rotX, rotY, 0);
+      primaryGroupRef.current.rotation.set(rotX, rotY, rotZ);
+      primaryGroupRef.current.scale.set(scaleX, scaleY, scaleZ);
     }
 
     if (
-      elapsed >= animation.totalDuration &&
+      elapsed >= choreo.totalDuration &&
       completedIdRef.current !== animation.id
     ) {
       completedIdRef.current = animation.id;
-
-      playStoneThud(animation.primary.isKnightHop ? 0.85 : 0.55);
-
-      dustRef.current?.emit(
-        pToX,
-        0.04,
-        pToZ,
-        animation.primary.isKnightHop ? 18 : 12,
-        0.3,
-        animation.primary.isKnightHop ? 1.1 : 0.75
-      );
-
-      if (animation.secondary) {
-        const [sToX, , sToZ] = squareToWorldPosition(
-          animation.secondary.toCoords.fileIndex,
-          animation.secondary.toCoords.rankIndex
-        );
-        dustRef.current?.emit(sToX, 0.04, sToZ, 10, 0.26, 0.75);
-      }
-
-      shakeRef.current?.trigger(
-        animation.primary.isKnightHop ? 0.085 : 0.055,
-        0.34
-      );
       onAnimationComplete(animation.id);
     }
   });
@@ -482,13 +672,18 @@ export function AnimatedMoveLayer({
   const primaryRotY = animation.primary.color === 'w' ? 0 : Math.PI;
   const secondaryRotY = animation.secondary?.color === 'w' ? 0 : Math.PI;
 
+  const initialPrimaryCoords = animation.isDragged
+    ? animation.primary.toCoords
+    : animation.primary.fromCoords;
+
   return (
     <group>
       <group
         ref={primaryGroupRef}
         position={squareToWorldPosition(
-          animation.primary.fromCoords.fileIndex,
-          animation.primary.fromCoords.rankIndex
+          initialPrimaryCoords.fileIndex,
+          initialPrimaryCoords.rankIndex,
+          animation.isDragged ? 0.34 : 0
         )}
         rotation={[0, primaryRotY, 0]}
       >

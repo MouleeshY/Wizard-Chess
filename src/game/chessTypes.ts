@@ -1,4 +1,5 @@
 import type { Color, PieceSymbol, Square } from 'chess.js';
+import type { MoveChoreographyPlan } from './movementCoordinator';
 
 export const FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] as const;
 export const TILE_SIZE = 1;
@@ -70,6 +71,7 @@ export interface PendingPromotion {
   from: Square;
   to: Square;
   color: Color;
+  isDragged?: boolean;
 }
 
 export interface PendingTutorWarning {
@@ -80,6 +82,7 @@ export interface PendingTutorWarning {
   pieceColor: Color;
   cpLoss: number;
   reason: string;
+  isDragged?: boolean;
 }
 
 export type PromotionPiece = Exclude<PieceSymbol, 'p' | 'k'>;
@@ -153,6 +156,8 @@ export interface ActiveMoveAnimation {
   };
   slideDuration: number;
   totalDuration: number;
+  isDragged?: boolean;
+  choreography: MoveChoreographyPlan;
 }
 
 export interface DebrisBurstData {
